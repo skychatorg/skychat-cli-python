@@ -1601,7 +1601,9 @@ class ChatUI:
                 has_url  = bool(URL_RE.search(sel_content))
                 has_btn  = bool(BUTTON_RE.search(sel_content))
                 link_hint = "  o=open  ◀▶=cycle" if (has_url or has_btn) else ""
-                sel_hint = f"  Spc=quote  e=edit{link_hint}"
+                is_own = sel_msg and sel_msg.get('user') == own_username
+                del_hint  = "  ⌫=delete" if is_own else ""
+                sel_hint = f"  Spc=quote  e=edit{del_hint}{link_hint}"
             else:
                 sel_hint = ""
             status_text = f"  ↑ {pos}/{total}{sel_hint}  Shift+↓ bottom"
@@ -2452,9 +2454,22 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             elif key == curses.KEY_SR:
                 ui.scroll_up(5)
             elif key in (curses.KEY_BACKSPACE, 127, '\x7f', 8):
-                ui.backspace()
+                if ui.scroll_cursor >= 0:
+                    # Delete own message while browsing history
+                    msg = (ui.messages[ui.scroll_cursor]
+                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
+                    if msg and msg.get('id') and msg.get('user') == client.current_user.get('username'):
+                        await client.send_message(f"/delete {msg['id']}")
+                        ui.set_status('✓  Message deleted', ttl=2.0)
+                        ui.scroll_cursor_clear()
+                        ui.scroll_bottom()
+                    elif msg:
+                        ui.set_status('✗  Can only delete your own messages', ttl=2.0)
+                else:
+                    ui.backspace()
             elif key == curses.KEY_DC:
-                ui.delete_char()
+                if ui.scroll_cursor < 0:
+                    ui.delete_char()
             elif key == curses.KEY_LEFT:
                 if ui.scroll_cursor >= 0:
                     # Cycle interactables backwards
@@ -2481,15 +2496,19 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 else:
                     ui.move_cursor(+1)
             elif key == curses.KEY_HOME:
-                ui.home()
+                if ui.scroll_cursor < 0:
+                    ui.home()
             elif key == curses.KEY_END:
-                ui.end()
+                if ui.scroll_cursor < 0:
+                    ui.end()
             elif isinstance(key, str) and key.isprintable():
-                ui.insert_char(key)
-                asyncio.ensure_future(client.notify_typing())
+                if ui.scroll_cursor < 0:
+                    ui.insert_char(key)
+                    asyncio.ensure_future(client.notify_typing())
             elif isinstance(key, int) and 32 <= key < 127:
-                ui.insert_char(chr(key))
-                asyncio.ensure_future(client.notify_typing())
+                if ui.scroll_cursor < 0:
+                    ui.insert_char(chr(key))
+                    asyncio.ensure_future(client.notify_typing())
 
         await asyncio.sleep(0.02)
 
