@@ -75,22 +75,6 @@ BINARY_MSG_AUDIO  = 0
 BINARY_MSG_CURSOR = 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dracula palette  (xterm-256 indices)
-# ─────────────────────────────────────────────────────────────────────────────
-
-DR_BG        = 236
-DR_CUR_LINE  = 237
-DR_FG        = 253
-DR_COMMENT   = 103
-DR_CYAN      = 117
-DR_GREEN     = 120
-DR_ORANGE    = 215
-DR_PINK      = 212
-DR_PURPLE    = 141
-DR_RED       = 203
-DR_YELLOW    = 228
-
 FB_BG     = curses.COLOR_BLACK
 FB_FG     = curses.COLOR_WHITE
 FB_ACCENT = curses.COLOR_MAGENTA
@@ -157,6 +141,31 @@ def _hex_to_xterm256(hex_color: str) -> int:
 
 def _strip_tags(s: str) -> str:
     return TAG_RE.sub('', s)
+
+
+def _char_width(ch: str) -> int:
+    """Return the terminal display width of a single character (1 or 2)."""
+    import unicodedata
+    eaw = unicodedata.east_asian_width(ch)
+    return 2 if eaw in ('W', 'F') else 1
+
+
+def _str_cols(s: str) -> int:
+    """Return the total terminal column width of string s."""
+    return sum(_char_width(ch) for ch in s)
+
+
+def _cols_slice(s: str, max_cols: int) -> str:
+    """Return the longest prefix of s that fits within max_cols terminal columns."""
+    cols = 0
+    result = []
+    for ch in s:
+        w = _char_width(ch)
+        if cols + w > max_cols:
+            break
+        result.append(ch)
+        cols += w
+    return ''.join(result)
 
 
 def _parse_reactions(storage: dict) -> dict:
@@ -1640,17 +1649,23 @@ class ChatUI:
 
             # Motto row
             if motto and row < H:
-                # Scrolling ticker: pad with spaces so it loops cleanly
-                padded = motto + "   "
-                plen   = len(padded)
-                phase  = (self._motto_tick // self._MOTTO_TICK_RATE) % plen
-                # Build visible slice, wrapping around
-                visible = (padded * 2)[phase: phase + motto_w]
-                visible = visible[:motto_w]  # hard clamp — never overflow
+                # Scrolling ticker — column-aware so wide CJK/emoji chars don't
+                # overflow the sidebar.  We advance phase in *characters* but
+                # measure the visible window in *columns*.
+                padded   = motto + "   "
+                loop_str = padded * 3   # enough to always find a full window
+                plen_ch  = len(padded)
+                phase_ch = (self._motto_tick // self._MOTTO_TICK_RATE) % plen_ch
+                # Advance past `phase_ch` characters, then take up to motto_w cols
+                tail    = loop_str[phase_ch:]
+                visible = _cols_slice(tail, motto_w)
+                # Pad to full column width so background is painted evenly
+                visible_cols = _str_cols(visible)
+                if visible_cols < motto_w:
+                    visible += ' ' * (motto_w - visible_cols)
                 try:
-                    w.addstr(row, 1, " " * (W - 2),  motto_attr)
-                    # Use addnstr to let curses enforce the byte limit
-                    w.addnstr(row, 4, visible, motto_w, motto_attr)
+                    w.addstr(row, 1, " " * (W - 2), motto_attr)
+                    w.addstr(row, 4, visible,        motto_attr)
                 except curses.error:
                     pass
                 row += 1
