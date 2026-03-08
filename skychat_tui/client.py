@@ -125,6 +125,7 @@ FOCUS_ORDER = [Focus.ROOMS, Focus.INPUT, Focus.USERS]
 TAG_RE     = re.compile(r'<[^>]+>')
 STICKER_RE = re.compile(r':([A-Za-z0-9_-]+):')
 URL_RE     = re.compile(r'https?://\S+')
+BUTTON_RE  = re.compile(r'\[\[([^/\[]+)/([^\[]+?)(?:\]\]|(?=\[\[))')
 
 
 def _hex_to_xterm256(hex_color: str) -> int:
@@ -986,6 +987,7 @@ class ChatUI:
         self._motto_offsets:  Dict[str, int] = {}  # identifier -> scroll offset
         self.scroll_offset: int   = 0
         self.scroll_cursor: int   = -1
+        self.btn_cursor:    int   = 0   # focused interactable index in selected message
         self.typing_list:   List[str] = []
 
         self._colour_pair_cache:  Dict[int, int] = {}
@@ -1351,7 +1353,8 @@ class ChatUI:
         for i in range(newest_idx, -1, -1):
             msg    = self.messages[i]
             prefix = len(msg["ts"]) + 1 + len(msg["user"]) + 2
-            nlines = sum(len(textwrap.wrap(ln, max(8, usable_w - prefix)) or [""]) for ln in msg["content"].split("\n"))
+            _disp_content = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', msg["content"])
+            nlines = sum(len(textwrap.wrap(ln, max(8, usable_w - prefix)) or [""]) for ln in _disp_content.split("\n"))
             if msg.get("quoted"):
                 nlines += 1
             if msg.get("reactions"):
@@ -1407,11 +1410,50 @@ class ChatUI:
 
             # Message lines
             prefix  = len(ts) + 1 + len(user) + 2
+            # Build wrapped chunks with pre-computed URL and button spans.
+            # Buttons [[title/action]] are replaced with [title] for display.
+            # All spans are computed on the display string before wrapping.
+            def _wrap_with_spans(line, width):
+                btn_matches = list(BUTTON_RE.finditer(line))
+                display     = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', line)
+                # Compute button spans in display space
+                btn_display_spans = []
+                offset = 0
+                for m in btn_matches:
+                    title, action = m.group(1), m.group(2)
+                    shrink  = (m.end() - m.start()) - (len(title) + 2)
+                    d_start = m.start() - offset
+                    btn_display_spans.append((d_start, d_start + len(title) + 2, title, action))
+                    offset += shrink
+                url_spans = [(m.start(), m.end(), m.group()) for m in URL_RE.finditer(display)]
+                chunks = textwrap.wrap(display, width) or [""]
+                result = []
+                orig_pos = 0
+                for ch in chunks:
+                    ci = display.find(ch, orig_pos)
+                    if ci == -1: ci = orig_pos
+                    ch_end   = ci + len(ch)
+                    orig_pos = ch_end
+                    ch_urls  = []
+                    for us, ue, uval in url_spans:
+                        os2, oe2 = max(us, ci), min(ue, ch_end)
+                        if os2 < oe2: ch_urls.append((os2 - ci, oe2 - ci, uval))
+                    ch_btns  = []
+                    for ds, de, title, action in btn_display_spans:
+                        os2, oe2 = max(ds, ci), min(de, ch_end)
+                        if os2 < oe2: ch_btns.append((os2 - ci, oe2 - ci, title, action))
+                    result.append((ch, ch_urls, ch_btns))
+                return result
+            # Collect all interactables (buttons+URLs) for this message for cycling
+            _msg_interactables = (
+                [(a, 'btn') for _, a in [(m.group(1), m.group(2)) for m in BUTTON_RE.finditer(msg_content)]]
+                + [(u, 'url') for u in URL_RE.findall(BUTTON_RE.sub('', msg_content))]
+            )
             wrapped = []
             for _ln in msg_content.split("\n"):
-                wrapped.extend(textwrap.wrap(_ln, max(8, usable_w - prefix)) or [""])
+                wrapped.extend(_wrap_with_spans(_ln, max(8, usable_w - prefix)))
 
-            for wi, chunk in enumerate(wrapped):
+            for wi, (chunk, chunk_urls, chunk_btns) in enumerate(wrapped):
                 if row >= H - 1:
                     break
                 is_first = (wi == 0)
@@ -1445,28 +1487,46 @@ class ChatUI:
                     # Draw chunk: highlight @mention in red, URLs underlined
                     remaining = chunk[:max(0, W - col - 1)]
 
-                    def _draw_segment(txt, base_attr):
-                        """Draw txt with URLs underlined, splitting around them."""
+                    def _draw_segment(txt, base_attr,
+                                      url_ranges=chunk_urls, btn_ranges=chunk_btns):
+                        """Draw txt with URLs underlined and buttons bold."""
                         nonlocal col
+                        # Merge url and btn spans, sorted by start position
+                        spans = sorted(
+                            [(s, e, 'url', uv) for s, e, uv in url_ranges] +
+                            [(s, e, 'btn', a)  for s, e, _, a in btn_ranges],
+                            key=lambda x: x[0]
+                        )
                         i2 = 0
-                        for m in URL_RE.finditer(txt):
+                        for ss, se, kind, action in spans:
                             if col >= W - 1: break
-                            if m.start() > i2:
-                                plain = txt[i2:m.start()][:max(0, W - col - 1)]
+                            if ss > i2:
+                                plain = _cols_slice(txt[i2:ss], max(0, W - col - 1))
                                 try: w.addstr(row, col, plain, base_attr)
                                 except curses.error: pass
-                                col += len(plain)
-                            url = m.group()[:max(0, W - col - 1)]
-                            try: w.addstr(row, col, url,
-                                          base_attr | curses.A_UNDERLINE)
+                                col += _str_cols(plain)
+                            seg = _cols_slice(txt[ss:se], max(0, W - col - 1))
+                            focused_val = (_msg_interactables[self.btn_cursor][0]
+                                           if is_sel and _msg_interactables else None)
+                            if kind == 'url':
+                                if is_sel and action == focused_val:
+                                    seg_attr = base_attr | curses.A_UNDERLINE | curses.A_REVERSE
+                                else:
+                                    seg_attr = base_attr | curses.A_UNDERLINE
+                            else:  # btn
+                                if is_sel and action == focused_val:
+                                    seg_attr = base_attr | curses.A_BOLD | curses.A_REVERSE
+                                else:
+                                    seg_attr = base_attr | curses.A_BOLD
+                            try: w.addstr(row, col, seg, seg_attr)
                             except curses.error: pass
-                            col += len(url)
-                            i2 = m.end()
+                            col += _str_cols(seg)
+                            i2 = se
                         if i2 < len(txt) and col < W - 1:
-                            plain = txt[i2:][:max(0, W - col - 1)]
+                            plain = _cols_slice(txt[i2:], max(0, W - col - 1))
                             try: w.addstr(row, col, plain, base_attr)
                             except curses.error: pass
-                            col += len(plain)
+                            col += _str_cols(plain)
 
                     if not is_sel and own_username and f'@{own_username}' in remaining:
                         needle = f'@{own_username}'
@@ -1511,8 +1571,10 @@ class ChatUI:
             pos      = total - self.scroll_offset
             if self.scroll_cursor >= 0:
                 sel_msg = self.messages[self.scroll_cursor] if 0 <= self.scroll_cursor < len(self.messages) else None
-                has_url = bool(sel_msg and URL_RE.search(sel_msg.get('content', '')))
-                link_hint = "  o=open link" if has_url else ""
+                sel_content  = sel_msg.get('content', '') if sel_msg else ''
+                has_url  = bool(URL_RE.search(sel_content))
+                has_btn  = bool(BUTTON_RE.search(sel_content))
+                link_hint = "  o=open  ◀▶=cycle" if (has_url or has_btn) else ""
                 sel_hint = f"  Spc=quote  e=edit{link_hint}"
             else:
                 sel_hint = ""
@@ -1784,6 +1846,7 @@ class ChatUI:
 
     def scroll_cursor_clear(self) -> None:
         self.scroll_cursor = -1
+        self.btn_cursor    = 0
 
     def scroll_up(self, n: int = 1) -> None:
         self.scroll_offset = min(self.scroll_offset + n, max(0, len(self.messages) - 1))
@@ -2317,6 +2380,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                             ui.scroll_cursor_clear()
                     else:
                         ui.scroll_cursor += 1
+                        ui.btn_cursor = 0
                 else:
                     ui.scroll_down(1)
 
@@ -2334,20 +2398,27 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status("✗  Can only edit your own messages", ttl=2.0)
 
             elif key in ('o', 'O') and ui.scroll_cursor >= 0:
-                # Open URL(s) from selected message in default browser
+                # Activate focused interactable in selected message
                 msg = (ui.messages[ui.scroll_cursor]
                        if 0 <= ui.scroll_cursor < len(ui.messages) else None)
                 if msg:
-                    urls = URL_RE.findall(msg.get('content', ''))
-                    if urls:
+                    _raw     = msg.get('content', '')
+                    _btns    = [(m.group(2), 'btn') for m in BUTTON_RE.finditer(_raw)]
+                    _urls    = [(u, 'url') for u in URL_RE.findall(BUTTON_RE.sub('', _raw))]
+                    _ias     = _btns + _urls
+                    if _ias:
+                        _idx  = ui.btn_cursor % len(_ias)
+                        _val, _kind = _ias[_idx]
                         import subprocess as _sp
-                        for url in urls:
-                            _sp.Popen(['xdg-open', url],
+                        if _kind == 'url' or _val.startswith('http'):
+                            _sp.Popen(['xdg-open', _val],
                                       stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                        plural = 's' if len(urls) > 1 else ''
-                        ui.set_status(f"↗  Opened {len(urls)} link{plural}", ttl=3.0)
+                            ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
+                        else:
+                            asyncio.ensure_future(client.send_message(_val))
+                            ui.set_status(f'▶  Sent: {_val[:50]}', ttl=2.0)
                     else:
-                        ui.set_status("No links in this message", ttl=2.0)
+                        ui.set_status('No links or buttons in this message', ttl=2.0)
 
             elif key == curses.KEY_SF:
                 ui.scroll_bottom()
@@ -2359,9 +2430,30 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             elif key == curses.KEY_DC:
                 ui.delete_char()
             elif key == curses.KEY_LEFT:
-                ui.move_cursor(-1)
+                if ui.scroll_cursor >= 0:
+                    # Cycle interactables backwards
+                    msg = (ui.messages[ui.scroll_cursor]
+                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
+                    if msg:
+                        _btns = [(m.group(2), "btn") for m in BUTTON_RE.finditer(msg.get("content", ""))]
+                        _urls = [(u, "url") for u in URL_RE.findall(BUTTON_RE.sub("", msg.get("content", "")))]
+                        _ias  = _btns + _urls
+                        if _ias:
+                            ui.btn_cursor = (ui.btn_cursor - 1) % len(_ias)
+                else:
+                    ui.move_cursor(-1)
             elif key == curses.KEY_RIGHT:
-                ui.move_cursor(+1)
+                if ui.scroll_cursor >= 0:
+                    msg = (ui.messages[ui.scroll_cursor]
+                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
+                    if msg:
+                        _btns = [(m.group(2), "btn") for m in BUTTON_RE.finditer(msg.get("content", ""))]
+                        _urls = [(u, "url") for u in URL_RE.findall(BUTTON_RE.sub("", msg.get("content", "")))]
+                        _ias  = _btns + _urls
+                        if _ias:
+                            ui.btn_cursor = (ui.btn_cursor + 1) % len(_ias)
+                else:
+                    ui.move_cursor(+1)
             elif key == curses.KEY_HOME:
                 ui.home()
             elif key == curses.KEY_END:
