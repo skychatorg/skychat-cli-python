@@ -1,0 +1,113 @@
+Remove all current debug logs or put them behind--debug launch option
+
+Indicate new messages and/or mentions in the channel list, maybe a blue dot for new messages and a red dot for direct mentions.
+
+The notifications don't seem to work at all, fix them.
+
+The users own chosen color is not replicated on their username in the chat like other connected users, my own username appears yellow no matter what it is set to on the server side, it is the right color in the users list, only my own username, only in the chat area.
+
+Allow the ability to pick username color from the server provided list of colors.
+
+Display each users motto in the user list in a similar way to quoted messages in chat but under their username, truncate it to make it fit and make it slowly scroll infinitely so the whole motto can be displayed, apply the same multi line selection/scrolling logic to the users list that you implemented in the chat column.
+
+Make sure the WS reconnection strategy is working fine in case the socket hangs or the computer goes to sleep for example, send the user back to the login screen if and only if such a situation would require a fresh token
+
+Possibly add images (mostly for stickers, the :code: stickers but also the risibank.fr/..... images, can work for uploads - skych.at/uploads/..... + image filetype links) do NOT store them locally, or at least in the most temporary place possible, while fetching images , consider the following half assed implementation:
+------------------------------------------------------------------------------
+# pip install textual textual-image pillow
+
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Static
+from textual_image import Image as TextualImage  # ← this one auto-detects
+from PIL import Image as PilImage
+
+class AutoImageApp(App):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+
+        pil_img = PilImage.open("example.jpg").convert("RGB")
+        pil_img.thumbnail((500, 400))  # recommended: keep reasonable size
+
+        # This will try:
+        # 1. Kitty graphics protocol (TGP) if detected
+        # 2. Sixel if available (works great in foot)
+        # 3. Unicode half-cell / block fallback if neither
+        yield Static(TextualImage(pil_img))
+
+if __name__ == "__main__":
+    AutoImageApp().run()
+--------------------------------------------------------------------------------
+
+Make the user able to drag/drop (wayland) or paste a picture and it uploads it and puts the link in the text input box, consider the following as inspiration:
+---------------------------------------------------------------------------------
+from __future__ import annotations
+from pathlib import Path
+import tempfile
+
+from textual.app import App, ComposeResult, on
+from textual.widgets import Header, Footer, Static, Input, Button
+from textual.containers import Vertical
+from textual.events import Paste
+from textual_image import Image as TextualImage  # pip install textual-image
+from PIL import Image as PilImage
+
+
+class ImagePasteDemo(App):
+    CSS = """
+    Screen { background: $surface; }
+    #preview { height: 60%; width: 100%; align: center middle; }
+    #status  { height: 2; content-align: center middle; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Vertical(
+            Static(id="preview"),
+            Input(placeholder="Paste image path here or drag & drop…", id="path"),
+            Button("Clear", id="clear"),
+            id="main"
+        )
+        yield Footer()
+        yield Static("Paste a file path or drop an image file", id="status")
+
+    @on(Paste)
+    def on_paste(self, event: Paste) -> None:
+        text = event.text.strip()
+        if not text:
+            return
+
+        # Often drag & drop pastes file:// or just /path/to/file.jpg
+        if text.startswith("file://"):
+            text = text[7:]
+        path = Path(text).expanduser()
+
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            self.display_image(path)
+            self.query_one("#status").update(f"Loaded: {path.name}")
+        else:
+            self.query_one("#status").update("Not a valid image path")
+
+    def display_image(self, path: Path | str) -> None:
+        try:
+            pil_img = PilImage.open(path).convert("RGB")
+            pil_img.thumbnail((800, 600))  # sane size for terminal
+
+            preview = self.query_one("#preview", Static)
+            preview.update(TextualImage(pil_img))  # auto: sixel in foot, TGP in kitty
+        except Exception as e:
+            self.query_one("#status").update(f"Error: {e}")
+
+    @on(Button.Pressed, "#clear")
+    def clear_image(self):
+        self.query_one("#preview", Static).update("")
+        self.query_one("#status").update("Cleared")
+
+
+if __name__ == "__main__":
+    ImagePasteDemo().run()
+-------------------------------------------------------------------------------------------------------------------
+
+If anything is too tricky or unreliable to implement i'd rather not have it implemented than have some broken code.
+Make sure that any feature like images just reverts back to raw url being displayed, or stickers be their :code: if the terminal emulator cannot handle those.
+
