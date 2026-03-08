@@ -1,6 +1,6 @@
 # skychat-tui
 
-Vibe coded client for [skych.at](https://skych.at), built with Python and curses.
+Vibe coded CLI client for [skych.at](https://skych.at), built with Python and curses.
 
 ## Install
 
