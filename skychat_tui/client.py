@@ -491,7 +491,65 @@ class SkyChatClient:
         await self._send_event("message", msg)
 
     async def open_dm(self, username: str) -> None:
-        await self.send_message(f"/pm {username}")
+        """Open a DM with username.
+
+        1. If a private room already exists whose whitelist/participants are
+           exactly {self, username}, join it directly.
+        2. Otherwise send /pm <username> and wait for the room-list to update,
+           then join the newly created room.
+        """
+        own    = self._user.get("username", "").lower()
+        target = username.lower()
+
+        def _find_existing() -> Optional[int]:
+            for room in self._rooms:
+                if not room.get("isPrivate"):
+                    continue
+                wl = room.get("whitelist") or room.get("allowedUsers") or []
+                if wl:
+                    members = set()
+                    for u in wl:
+                        if isinstance(u, dict):
+                            members.add(u.get("username", "").lower())
+                        elif isinstance(u, str):
+                            members.add(u.lower())
+                    if members == {own, target}:
+                        return room.get("id")
+                name = room.get("name", "")
+                if name.lower().startswith("pm:"):
+                    parts = {p.strip().lower() for p in name[3:].split(",")}
+                    if parts == {own, target}:
+                        return room.get("id")
+            return None
+
+        existing = _find_existing()
+        if existing is not None:
+            await self.join(existing)
+            return
+
+        rooms_before = {r.get("id") for r in self._rooms}
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        def _on_room_list(rooms):
+            if fut.done():
+                return
+            for room in rooms:
+                if room.get("id") in rooms_before:
+                    continue
+                if not room.get("isPrivate"):
+                    continue
+                if not fut.done():
+                    fut.set_result(room.get("id"))
+
+        self.on("room-list", _on_room_list)
+        try:
+            await self.send_message(f"/pm {username}")
+            new_id = await asyncio.wait_for(fut, timeout=10)
+            await self.join(new_id)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self.off("room-list", _on_room_list)
 
     async def notify_typing(self) -> None:
         if not self._typing_active:
@@ -1117,7 +1175,7 @@ class ChatUI:
             self.typing_list = typing_list
         try:
             self._draw_header(rooms, current_room_id, own_username)
-            self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker)
+            self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker, own_username=own_username)
             self._draw_chat(own_username)
             self._draw_users(connected_list, current_room_id, own_user=self._own_user)
             self._draw_input()
@@ -1141,7 +1199,17 @@ class ChatUI:
         w.erase()
         _, W  = w.getmaxyx()
         room  = next((r for r in rooms if r.get("id") == room_id), None)
-        rname = f"# {room['name']}" if room else "~ SkyChat"
+        if room:
+            rname_raw = room.get("name", "") or ""
+            if not rname_raw and room.get("isPrivate"):
+                wl = room.get("whitelist") or room.get("allowedUsers") or []
+                own_l = username.lower()
+                parts = [u.get("username", "") if isinstance(u, dict) else str(u) for u in wl]
+                parts = [p for p in parts if p and p.lower() != own_l]
+                rname_raw = ", ".join(parts) or str(room.get("id", "?"))
+            rname = f"@ {rname_raw}" if room.get("isPrivate") else f"# {rname_raw}"
+        else:
+            rname = "~ SkyChat"
         dot   = "●" if room_id is not None else "○"
         hint  = f"[Tab] {self.focus.name}"
         left  = f" {dot}  {rname}"
@@ -1158,7 +1226,8 @@ class ChatUI:
 
     def _draw_rooms(self, rooms: List[Dict], current_room_id: Optional[int],
                     connected_list: List[Dict] = [],
-                    unread_checker: Optional[Callable] = None) -> None:
+                    unread_checker: Optional[Callable] = None,
+                    own_username: str = "") -> None:
         w = self.win_rooms
         w.erase()
         H, W    = w.getmaxyx()
@@ -1192,7 +1261,15 @@ class ChatUI:
                 rid_int = int(rid_val)
             except (ValueError, TypeError):
                 rid_int = rid_val
-            name      = room.get("name", str(rid_val if rid_val is not None else "?"))
+            name      = room.get("name", "") or ""
+            if not name and room.get("isPrivate"):
+                wl = room.get("whitelist") or room.get("allowedUsers") or []
+                own_l = own_username.lower()
+                parts = [u.get("username", "") if isinstance(u, dict) else str(u) for u in wl]
+                parts = [p for p in parts if p and p.lower() != own_l]
+                name = ", ".join(parts) or str(rid_val if rid_val is not None else "?")
+            elif not name:
+                name = str(rid_val if rid_val is not None else "?")
             count     = room_counts.get(rid_int, 0)
             is_cur    = focused and i == self.room_cursor
             is_join   = rid_int == current_room_id
@@ -1726,6 +1803,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     curses.curs_set(1)
     stdscr.nodelay(True)
     stdscr.keypad(True)
+    try:
+        curses.set_escdelay(25)  # Python 3.9+; silently ignored if unavailable
+    except AttributeError:
+        pass
 
     ui     = ChatUI(stdscr)
     client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
@@ -2035,18 +2116,18 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     # Update local user data immediately so chat re-renders with new colour
                     try:
                         plugins = client._user.setdefault('data', {}).setdefault('plugins', {})
-                        plugins['color'] = hex_val
+                        plugins.setdefault('custom', {})['color'] = hex_val
                     except Exception:
                         pass
                     # Update local user data, messages, and connected-list immediately
                     own = client.current_user.get('username', '')
                     own_id = client.current_user.get('id')
-                    # Invalidate cached hex pair so new colour gets re-allocated
-                    old_hex = client._user.get('data', {}).get('plugins', {}).get('color', '')
+                    # Invalidate cached hex pair (read from custom.color, not top-level color)
+                    old_hex = client._user.get('data', {}).get('plugins', {}).get('custom', {}).get('color', '')
                     if old_hex:
                         old_key = old_hex.lower().lstrip('#')
                         ui._colour_pair_cache.pop(old_key, None)
-                    # Update own user object
+                    # Update own user object (custom.color is what /custom use sets)
                     client._user.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
                     # Update messages
                     for m in ui.messages:
@@ -2057,7 +2138,6 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                         u = session.get('user', {})
                         if isinstance(u, dict) and u.get('id') == own_id:
                             u.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
-                            u['data']['plugins'].pop('custom', None)
                             break
                     ui.colour_pick_open = False
                     ui.menu_open = False
@@ -2331,6 +2411,9 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true",
                         help="Write crash tracebacks to /tmp/skychat_crash.log")
     args = parser.parse_args()
+    # Reduce ncurses ESC disambiguation delay from the default ~1 s to 25 ms.
+    # Must be set before curses.wrapper() initialises the terminal.
+    os.environ.setdefault("ESCDELAY", "25")
     try:
         curses.wrapper(_run, args.username, args.password)
     except KeyboardInterrupt:
