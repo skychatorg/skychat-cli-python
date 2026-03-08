@@ -168,6 +168,8 @@ def _cols_slice(s: str, max_cols: int) -> str:
     return ''.join(result)
 
 
+
+
 def _parse_reactions(storage: dict) -> dict:
     if not storage or not isinstance(storage, dict):
         return {}
@@ -1349,7 +1351,7 @@ class ChatUI:
         for i in range(newest_idx, -1, -1):
             msg    = self.messages[i]
             prefix = len(msg["ts"]) + 1 + len(msg["user"]) + 2
-            nlines = len(textwrap.wrap(msg["content"], max(8, usable_w - prefix)) or [""])
+            nlines = sum(len(textwrap.wrap(ln, max(8, usable_w - prefix)) or [""]) for ln in msg["content"].split("\n"))
             if msg.get("quoted"):
                 nlines += 1
             if msg.get("reactions"):
@@ -1405,7 +1407,9 @@ class ChatUI:
 
             # Message lines
             prefix  = len(ts) + 1 + len(user) + 2
-            wrapped = textwrap.wrap(msg_content, max(8, usable_w - prefix)) or [""]
+            wrapped = []
+            for _ln in msg_content.split("\n"):
+                wrapped.extend(textwrap.wrap(_ln, max(8, usable_w - prefix)) or [""])
 
             for wi, chunk in enumerate(wrapped):
                 if row >= H - 1:
