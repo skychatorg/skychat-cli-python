@@ -169,6 +169,32 @@ def _cols_slice(s: str, max_cols: int) -> str:
     return ''.join(result)
 
 
+def _cols_aware_wrap(text: str, width: int) -> List[str]:
+    """Column-aware line wrap.  Splits on whitespace and after ']' so that
+    runs of wide-character buttons never overflow the terminal width."""
+    if not text:
+        return [""]
+    lines: List[str] = []
+    current = ""
+    current_cols = 0
+    for ch in text:
+        ch_w = _char_width(ch)
+        if current_cols + ch_w > width:
+            if current:
+                lines.append(current)
+            current, current_cols = ch, ch_w
+        else:
+            current += ch
+            current_cols += ch_w
+            # Opportunistic split after ] or space when near the limit
+            if ch in (']', ' ') and current_cols >= width - 3:
+                lines.append(current.rstrip())
+                current, current_cols = "", 0
+    if current.strip():
+        lines.append(current)
+    return lines or [""]
+
+
 
 
 def _parse_reactions(storage: dict) -> dict:
@@ -1354,7 +1380,7 @@ class ChatUI:
             msg    = self.messages[i]
             prefix = len(msg["ts"]) + 1 + len(msg["user"]) + 2
             _disp_content = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', msg["content"])
-            nlines = sum(len(textwrap.wrap(ln, max(8, usable_w - prefix)) or [""]) for ln in _disp_content.split("\n"))
+            nlines = sum(len(_cols_aware_wrap(ln, max(8, usable_w - prefix))) for ln in _disp_content.split("\n"))
             if msg.get("quoted"):
                 nlines += 1
             if msg.get("reactions"):
@@ -1426,7 +1452,7 @@ class ChatUI:
                     btn_display_spans.append((d_start, d_start + len(title) + 2, title, action))
                     offset += shrink
                 url_spans = [(m.start(), m.end(), m.group()) for m in URL_RE.finditer(display)]
-                chunks = textwrap.wrap(display, width) or [""]
+                chunks = _cols_aware_wrap(display, width)
                 result = []
                 orig_pos = 0
                 for ch in chunks:
