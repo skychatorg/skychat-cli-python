@@ -32,6 +32,7 @@ import re
 import struct
 import sys
 import textwrap
+import time
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1009,7 +1010,6 @@ class ChatUI:
         self.room_cursor:   int   = 0
         self.user_cursor:     int   = 0
         self.user_scroll:     int   = 0   # top user index in viewport
-        self._motto_tick:     int   = 0   # increments each draw, drives scroll
         self._motto_offsets:  Dict[str, int] = {}  # identifier -> scroll offset
         self.scroll_offset: int   = 0
         self.scroll_cursor: int   = -1
@@ -1630,8 +1630,8 @@ class ChatUI:
 
     # ── Users sidebar ─────────────────────────────────────────────────
 
-    # Motto scrolls one char every N draw ticks
-    _MOTTO_TICK_RATE = 20
+    # Motto scrolls one character every this many seconds
+    _MOTTO_CHAR_INTERVAL = 0.25
 
     def _draw_users(self, connected_list: List[Dict],
                     current_room_id: Optional[int] = None,
@@ -1661,9 +1661,6 @@ class ChatUI:
                      curses.color_pair(C_HEADER) | curses.A_BOLD)
         except curses.error:
             pass
-
-        # Advance motto tick
-        self._motto_tick += 1
 
         # Compute row height per user (2 if has motto, 1 if not)
         def _motto(session) -> str:
@@ -1749,7 +1746,7 @@ class ChatUI:
                 padded   = motto + "   "
                 loop_str = padded * 3   # enough to always find a full window
                 plen_ch  = len(padded)
-                phase_ch = (self._motto_tick // self._MOTTO_TICK_RATE) % plen_ch
+                phase_ch = int(time.monotonic() / self._MOTTO_CHAR_INTERVAL) % plen_ch
                 # Advance past `phase_ch` characters, then take up to motto_w cols
                 tail    = loop_str[phase_ch:]
                 visible = _cols_slice(tail, motto_w)
@@ -2197,6 +2194,20 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         if key == curses.KEY_RESIZE:
             ui.resize()
+            # Drain any further resize events that queued up during the resize
+            # so we don't spin through them all without ever yielding.
+            while True:
+                try:
+                    k2 = stdscr.get_wch()
+                    if k2 != curses.KEY_RESIZE:
+                        # Non-resize key came in — push it back by breaking and
+                        # handling it on the next iteration via a small state flag.
+                        # Simplest safe option: just discard it (resize mid-keystroke
+                        # is inherently lossy) and fall through to the sleep.
+                        break
+                except curses.error:
+                    break
+            await asyncio.sleep(0.02)
             continue
 
         # Esc toggles the menu
@@ -2437,10 +2448,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     if _ias:
                         _idx  = ui.btn_cursor % len(_ias)
                         _val, _kind = _ias[_idx]
-                        import subprocess as _sp
+                        import webbrowser
                         if _kind == 'url' or _val.startswith('http'):
-                            _sp.Popen(['xdg-open', _val],
-                                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            webbrowser.open(_val)
                             ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
                         else:
                             asyncio.ensure_future(client.send_message(_val))
@@ -2514,10 +2524,11 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
     # Cleanup
     client._running = False
+    await client.disconnect()
     conn_task.cancel()
     try:
         await conn_task
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
         pass
 
 
