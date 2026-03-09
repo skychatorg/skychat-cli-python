@@ -319,11 +319,22 @@ class SkyChatClient:
         self._typing_task:   Optional[asyncio.Task] = None
         self._handlers:      Dict[str, List[Callable]] = {}
 
+        # Scroll-read ack: track which message we last sent /lastseen for,
+        # and debounce so we only fire after the viewport has been stable 1s.
+        self._scroll_ack_last_sent: int   = 0   # highest mid we confirmed to server
+        self._scroll_ack_candidate: int   = 0   # newest visible mid this frame
+        self._scroll_ack_since:     float = 0.0 # monotonic time candidate first seen
+
         self.on("set-user",       self._on_set_user)
         self.on("auth-token",     self._on_auth_token)
         self.on("config",         lambda _: None)
         self.on("room-list",      lambda r: setattr(self, '_rooms', r))
-        self.on("join-room",      lambda rid: setattr(self, '_current_room_id', rid))
+        def _on_join_room(rid):
+            self._current_room_id    = rid
+            self._scroll_ack_last_sent = 0
+            self._scroll_ack_candidate = 0
+            self._scroll_ack_since     = 0.0
+        self.on("join-room", _on_join_room)
         def _on_connected_list(s):
             self._connected_list = s
             self._connected_list_dirty = True
@@ -402,6 +413,33 @@ class SkyChatClient:
 
     async def _ack(self, mid: int) -> None:
         await self.send_message(f"/lastseen {mid}")
+
+    def scroll_ack_tick(self, newest_visible_mid: int) -> None:
+        """Call each frame with the highest message-id currently visible.
+
+        Sends /lastseen once the viewport has been stable on a new high-water
+        mark for at least 1 second, and only if the id exceeds what we already
+        confirmed.  Fires-and-forgets via ensure_future so it never blocks.
+        """
+        if newest_visible_mid <= self._scroll_ack_last_sent:
+            # Already acked this message or nothing new to ack
+            self._scroll_ack_candidate = 0
+            return
+
+        now = time.monotonic()
+        if newest_visible_mid != self._scroll_ack_candidate:
+            # Viewport moved — restart the debounce timer
+            self._scroll_ack_candidate = newest_visible_mid
+            self._scroll_ack_since     = now
+            return
+
+        if now - self._scroll_ack_since < 1.0:
+            # Still within debounce window
+            return
+
+        # Stable for >= 1s and above the last confirmed id — send it
+        self._scroll_ack_last_sent = newest_visible_mid
+        asyncio.ensure_future(self._ack(newest_visible_mid))
 
     # ── WebSocket lifecycle ────────────────────────────────────────────
 
@@ -2464,6 +2502,20 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             own_user        = client.current_user,
             unread_checker  = client.has_unread_messages,
         )
+
+        # Scroll-read ack: find the highest message-id currently on screen
+        # and notify the server once the viewport has been stable for 1s.
+        if ui.messages and client.current_user.get("id", 0) != 0:
+            oldest_idx, newest_idx = ui._last_msg_range
+            _visible_mid = 0
+            for _vi in range(newest_idx, oldest_idx - 1, -1):
+                if 0 <= _vi < len(ui.messages):
+                    _mid = ui.messages[_vi].get("id", 0)
+                    if _mid:
+                        _visible_mid = _mid
+                        break
+            if _visible_mid:
+                client.scroll_ack_tick(_visible_mid)
 
         try:
             key = stdscr.get_wch()
