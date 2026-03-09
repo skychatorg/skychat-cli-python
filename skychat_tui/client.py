@@ -130,6 +130,39 @@ URL_RE     = re.compile(r'https?://\S+')
 BUTTON_RE  = re.compile(r'\[\[([^/\[]+)/([^\[]+?)(?:\]\]|(?=\[\[))')
 
 
+def _draw_box(stdscr, y: int, x: int, h: int, w: int,
+              colour_pair: int, title: str = "") -> None:
+    """Draw a rounded-corner box on *stdscr* using *colour_pair*."""
+    attr = colour_pair | curses.A_BOLD
+    H, W = stdscr.getmaxyx()
+    try:
+        for r in range(h):
+            stdscr.addstr(y + r, x, " " * w, colour_pair)
+        for r in range(1, h - 1):
+            stdscr.addch(y + r, x,         '│', attr)
+            stdscr.addch(y + r, x + w - 1, '│', attr)
+        for c in range(1, w - 1):
+            stdscr.addch(y,         x + c, '─', attr)
+            stdscr.addch(y + h - 1, x + c, '─', attr)
+        stdscr.addch(y,         x,         '╭', attr)
+        stdscr.addch(y,         x + w - 1, '╮', attr)
+        stdscr.addch(y + h - 1, x,         '╰', attr)
+        stdscr.addch(y + h - 1, x + w - 1, '╯', attr)
+        if title:
+            stdscr.addstr(y, x + (w - len(title)) // 2, title, attr)
+    except curses.error:
+        pass
+
+
+def _printable_char(key) -> str:
+    """Return the printable character for *key*, or empty string if not printable."""
+    if isinstance(key, str) and key.isprintable():
+        return key
+    if isinstance(key, int) and 32 <= key < 127:
+        return chr(key)
+    return ""
+
+
 def _get_interactables(content: str) -> List[Tuple[str, str]]:
     """Return list of (value, kind) for all buttons and URLs in content.
     kind is 'btn' or 'url'.  Buttons come first, then URLs."""
@@ -796,10 +829,11 @@ def ncurses_login(stdscr, prefill_username: str = '',
             base.append(LoginField.BTN_RESUME)
         return base
 
+    field_order = _field_order()  # static — has_token never changes in the loop
+
     while True:
         stdscr.erase()
         H, W = stdscr.getmaxyx()
-        field_order = _field_order()
 
         logo_top = max(0, H // 2 - 12)
         for i, line in enumerate(LOGO):
@@ -826,24 +860,8 @@ def ncurses_login(stdscr, prefill_username: str = '',
         box_y = logo_top + len(LOGO) + 2
         box_x = max(0, (W - box_w) // 2)
 
-        try:
-            for r in range(box_h):
-                for c in range(box_w):
-                    if r in (0, box_h - 1):
-                        ch = '─'
-                    elif c in (0, box_w - 1):
-                        ch = '│'
-                    else:
-                        ch = ' '
-                    brow, bcol = box_y + r, box_x + c
-                    if 0 <= brow < H and 0 <= bcol < W:
-                        stdscr.addch(brow, bcol, ch, curses.color_pair(C_BORDER))
-            stdscr.addch(box_y,           box_x,           '╭', curses.color_pair(C_BORDER))
-            stdscr.addch(box_y,           box_x + box_w-1, '╮', curses.color_pair(C_BORDER))
-            stdscr.addch(box_y + box_h-1, box_x,           '╰', curses.color_pair(C_BORDER))
-            stdscr.addch(box_y + box_h-1, box_x + box_w-1, '╯', curses.color_pair(C_BORDER))
-        except curses.error:
-            pass
+        _draw_box(stdscr, box_y, box_x, box_h, box_w,
+                  curses.color_pair(C_BORDER))
 
         inner_x     = box_x + 2
         field_w     = box_w - 4
@@ -976,14 +994,7 @@ def ncurses_login(stdscr, prefill_username: str = '',
             elif field == LoginField.PASSWORD and password_buf:
                 password_buf = password_buf[:-1]
 
-        elif isinstance(key, str) and key.isprintable():
-            if field == LoginField.USERNAME:
-                username_buf += key
-            elif field == LoginField.PASSWORD:
-                password_buf += key
-
-        elif isinstance(key, int) and 32 <= key < 127:
-            ch = chr(key)
+        elif ch := _printable_char(key):
             if field == LoginField.USERNAME:
                 username_buf += ch
             elif field == LoginField.PASSWORD:
@@ -1131,26 +1142,9 @@ class ChatUI:
     # ── Master draw ───────────────────────────────────────────────────
 
     def _draw_box(self, y: int, x: int, h: int, w: int, title: str = "") -> None:
-        """Draw a rounded box overlay."""
-        try:
-            for r in range(h):
-                self.stdscr.addstr(y + r, x, " " * w, curses.color_pair(C_INPUT))
-            corners = ['╭','╮','╰','╯']
-            self.stdscr.addch(y,     x,     corners[0], curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            self.stdscr.addch(y,     x+w-1, corners[1], curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            self.stdscr.addch(y+h-1, x,     corners[2], curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            self.stdscr.addch(y+h-1, x+w-1, corners[3], curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            for r in range(1, h - 1):
-                self.stdscr.addch(y+r, x,     '│', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-                self.stdscr.addch(y+r, x+w-1, '│', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            for c in range(1, w - 1):
-                self.stdscr.addch(y,     x+c, '─', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-                self.stdscr.addch(y+h-1, x+c, '─', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            if title:
-                self.stdscr.addstr(y, x + (w - len(title)) // 2,
-                                   title, curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-        except curses.error:
-            pass
+        """Draw a rounded box overlay (delegates to module-level _draw_box)."""
+        _draw_box(self.stdscr, y, x, h, w,
+                  curses.color_pair(C_ITEM_ACTIVE), title=title)
 
     def _draw_menu(self, own_username: str) -> None:
         """Draw the Esc overlay menu centred over the chat area."""
@@ -2443,13 +2437,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             if ui.scroll_cursor < 0:
                 ui.end()
 
-        elif isinstance(key, str) and key.isprintable():
+        elif ch := _printable_char(key):
             if ui.scroll_cursor < 0:
-                ui.insert_char(key)
-                asyncio.ensure_future(client.notify_typing())
-        elif isinstance(key, int) and 32 <= key < 127:
-            if ui.scroll_cursor < 0:
-                ui.insert_char(chr(key))
+                ui.insert_char(ch)
                 asyncio.ensure_future(client.notify_typing())
 
         return False
