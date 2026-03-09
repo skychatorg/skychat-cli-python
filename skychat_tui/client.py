@@ -31,8 +31,9 @@ import os
 import re
 import struct
 import sys
-import textwrap
 import time
+import unicodedata
+import webbrowser
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -129,6 +130,14 @@ URL_RE     = re.compile(r'https?://\S+')
 BUTTON_RE  = re.compile(r'\[\[([^/\[]+)/([^\[]+?)(?:\]\]|(?=\[\[))')
 
 
+def _get_interactables(content: str) -> List[Tuple[str, str]]:
+    """Return list of (value, kind) for all buttons and URLs in content.
+    kind is 'btn' or 'url'.  Buttons come first, then URLs."""
+    btns = [(m.group(2), 'btn') for m in BUTTON_RE.finditer(content)]
+    urls = [(u, 'url') for u in URL_RE.findall(BUTTON_RE.sub('', content))]
+    return btns + urls
+
+
 def _hex_to_xterm256(hex_color: str) -> int:
     try:
         h = hex_color.lstrip('#')
@@ -147,7 +156,6 @@ def _strip_tags(s: str) -> str:
 
 def _char_width(ch: str) -> int:
     """Return the terminal display width of a single character (1 or 2)."""
-    import unicodedata
     eaw = unicodedata.east_asian_width(ch)
     return 2 if eaw in ('W', 'F') else 1
 
@@ -217,14 +225,13 @@ AFK_SECONDS = 5 * 60
 
 
 def _user_status(session: dict):
-    import time as _time
     rooms = session.get('rooms') or []
     if not rooms:
         return '○', C_USER_RECENT
     last = session.get('lastInteractionTime')
     if last is not None:
         try:
-            if _time.time() - float(last) > AFK_SECONDS:
+            if time.time() - float(last) > AFK_SECONDS:
                 return '◐', C_USER_AFK
         except Exception:
             pass
@@ -1010,7 +1017,6 @@ class ChatUI:
         self.room_cursor:   int   = 0
         self.user_cursor:     int   = 0
         self.user_scroll:     int   = 0   # top user index in viewport
-        self._motto_offsets:  Dict[str, int] = {}  # identifier -> scroll offset
         self.scroll_offset: int   = 0
         self.scroll_cursor: int   = -1
         self.btn_cursor:    int   = 0   # focused interactable index in selected message
@@ -1036,6 +1042,7 @@ class ChatUI:
         self.colour_pick_open:      bool       = False
         self.colour_pick_cursor:    int        = 0
         self.unread: Dict[int, str] = {}  # room_id -> 'mention' | 'unread'
+        self._ordered_users: List[Dict] = []  # mirrors draw order for key handler
 
         self._build_windows()
 
@@ -1077,36 +1084,49 @@ class ChatUI:
 
     # ── Messages ──────────────────────────────────────────────────────
 
-    def add_message(self, msg: Dict, ts: str = "") -> None:
-        if not ts:
-            ts = _parse_msg_ts(msg)
+    @staticmethod
+    def _msg_to_entry(msg: Dict, storage: Optional[Dict] = None) -> Optional[Dict]:
+        """Convert a raw server message dict into a normalised entry dict.
+
+        Returns None if the message has no displayable content.
+        Pass storage=msg.get("storage") for history messages that carry reactions.
+        """
         user_obj = msg.get("user", {})
         user     = user_obj.get("username", "?") if isinstance(user_obj, dict) else str(user_obj)
         content  = _strip_tags(msg.get("content") or msg.get("formatted") or "")
-        msg_id   = msg.get("id", 0)
-        plugins  = user_obj.get("data", {}).get("plugins", {}) if isinstance(user_obj, dict) else {}
-        hex_col  = plugins.get("custom", {}).get("color", "") or plugins.get("color", "")
-        col      = hex_col or ""
+        if not content:
+            return None
+        msg_id  = msg.get("id", 0)
+        plugins = user_obj.get("data", {}).get("plugins", {}) if isinstance(user_obj, dict) else {}
+        col     = plugins.get("custom", {}).get("color", "") or plugins.get("color", "") or ""
         quoted_msg = None
         quoted = msg.get("quoted")
         if quoted and isinstance(quoted, dict):
             q_user = quoted.get("user", {})
             q_name = q_user.get("username", "?") if isinstance(q_user, dict) else str(q_user)
             q_text = _strip_tags(quoted.get("content") or quoted.get("formatted") or "")
-            q_ts   = _parse_msg_ts(quoted) if any(quoted.get(k) for k in
-                     ('date','createdTimestamp','createdAt','timestamp','time','created_at')) else ""
+            q_ts   = (_parse_msg_ts(quoted) if any(quoted.get(k) for k in
+                      ('date', 'createdTimestamp', 'createdAt', 'timestamp', 'time', 'created_at'))
+                      else "")
             quoted_msg = {"user": q_name, "text": q_text, "ts": q_ts}
-        if content:
-            self.messages.append({
-                "ts": ts, "user": user, "content": content,
-                "id": msg_id, "col": col,
-                "quoted": quoted_msg, "reactions": {},
-            })
+        return {
+            "ts":        _parse_msg_ts(msg),
+            "user":      user,
+            "content":   content,
+            "id":        msg_id,
+            "col":       col,
+            "quoted":    quoted_msg,
+            "reactions": _parse_reactions(storage) if storage else {},
+        }
+
+    def add_message(self, msg: Dict) -> None:
+        entry = self._msg_to_entry(msg)
+        if entry:
+            self.messages.append(entry)
 
     def set_status(self, text: str, ttl: float = 5.0) -> None:
-        import time as _time
         self.status_msg   = text
-        self.status_until = _time.monotonic() + ttl if text else 0.0
+        self.status_until = time.monotonic() + ttl if text else 0.0
 
     # ── Master draw ───────────────────────────────────────────────────
 
@@ -1356,264 +1376,230 @@ class ChatUI:
 
     # ── Chat pane ─────────────────────────────────────────────────────
 
-    def _draw_chat(self, own_username: str) -> None:
-        w = self.win_chat
-        w.erase()
-        H, W     = w.getmaxyx()
-        margin   = 2
-        usable_w = max(1, W - margin * 2)
-        self._last_visible_count = 0
+    @staticmethod
+    def _wrap_with_spans(line: str, width: int) -> List[tuple]:
+        """Wrap one logical line and annotate each chunk with URL/button spans.
 
-        total = len(self.messages)
-        if total == 0:
-            self._last_msg_range = (0, 0)
-            self._last_lines_out = []
-            return
+        Returns list of (chunk_str, url_spans, btn_spans) where:
+          url_spans = [(start, end, url_value), ...]
+          btn_spans = [(start, end, title, action), ...]
+        All positions are relative to the start of the chunk string.
+        """
+        btn_matches = list(BUTTON_RE.finditer(line))
+        display     = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', line)
+        btn_display_spans = []
+        offset = 0
+        for m in btn_matches:
+            title, action = m.group(1), m.group(2)
+            shrink  = (m.end() - m.start()) - (len(title) + 2)
+            d_start = m.start() - offset
+            btn_display_spans.append((d_start, d_start + len(title) + 2, title, action))
+            offset += shrink
+        url_spans = [(m.start(), m.end(), m.group()) for m in URL_RE.finditer(display)]
+        chunks    = _cols_aware_wrap(display, width)
+        result    = []
+        orig_pos  = 0
+        for ch in chunks:
+            ci = display.find(ch, orig_pos)
+            if ci == -1: ci = orig_pos
+            ch_end   = ci + len(ch)
+            orig_pos = ch_end
+            ch_urls  = []
+            for us, ue, uval in url_spans:
+                os2, oe2 = max(us, ci), min(ue, ch_end)
+                if os2 < oe2: ch_urls.append((os2 - ci, oe2 - ci, uval))
+            ch_btns  = []
+            for ds, de, title, action in btn_display_spans:
+                os2, oe2 = max(ds, ci), min(de, ch_end)
+                if os2 < oe2: ch_btns.append((os2 - ci, oe2 - ci, title, action))
+            result.append((ch, ch_urls, ch_btns))
+        return result
 
-        self.scroll_offset = max(0, min(self.scroll_offset, total - 1))
-        newest_idx = total - 1 - self.scroll_offset
+    @staticmethod
+    def _msg_line_count(msg: dict, usable_w: int) -> int:
+        """Return the number of terminal rows a message will occupy."""
+        prefix     = len(msg["ts"]) + 1 + len(msg["user"]) + 2
+        disp       = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', msg["content"])
+        nlines     = sum(
+            len(_cols_aware_wrap(ln, max(8, usable_w - prefix)))
+            for ln in disp.split("\n")
+        )
+        if msg.get("quoted"):    nlines += 1
+        if msg.get("reactions"): nlines += 1
+        return nlines
 
-        rows_avail = H - 1
-        render_msgs: List[int] = []
-        rows_used = 0
-        for i in range(newest_idx, -1, -1):
-            msg    = self.messages[i]
-            prefix = len(msg["ts"]) + 1 + len(msg["user"]) + 2
-            _disp_content = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', msg["content"])
-            nlines = sum(len(_cols_aware_wrap(ln, max(8, usable_w - prefix))) for ln in _disp_content.split("\n"))
-            if msg.get("quoted"):
-                nlines += 1
-            if msg.get("reactions"):
-                nlines += 1
-            if rows_used + nlines > rows_avail and render_msgs:
+    def _draw_message(
+        self, w, msg: dict, mi: int, row: int,
+        H: int, W: int, margin: int, usable_w: int,
+        own_username: str, lines_out: list,
+    ) -> int:
+        """Render one message starting at *row*. Returns the next free row."""
+        ts, user, msg_content = msg["ts"], msg["user"], msg["content"]
+        is_sel = (self.scroll_cursor == mi)
+        sel_a  = curses.color_pair(C_MSG_SELECT)
+        qt_a   = curses.color_pair(C_TIMESTAMP)
+        prefix = len(ts) + 1 + len(user) + 2
+
+        # ── Quoted line ───────────────────────────────────────────────
+        qdata = msg.get("quoted")
+        if qdata and row < H - 1:
+            q_ts     = qdata.get("ts", "")
+            q_prefix = f"  ↩ {qdata['user']}"
+            if q_ts:
+                q_prefix += f" [{q_ts}]"
+            q_prefix += ": "
+            avail  = max(4, W - margin - len(q_prefix) - 1)
+            q_text = qdata["text"].replace("\n", " ").strip()
+            if len(q_text) > avail:
+                q_text = q_text[:avail - 1] + "…"
+            q_line = q_prefix + q_text
+            try:
+                if is_sel:
+                    w.addstr(row, 0, " " * (W - 1), sel_a)
+                w.addstr(row, margin, q_line[:max(0, W - margin - 1)],
+                         sel_a if is_sel else qt_a)
+            except curses.error:
+                pass
+            lines_out.append((ts, user, q_line, False))
+            row += 1
+
+        # ── Wrapped content lines ─────────────────────────────────────
+        _msg_interactables = _get_interactables(msg_content)
+        wrapped = []
+        for _ln in msg_content.split("\n"):
+            wrapped.extend(ChatUI._wrap_with_spans(_ln, max(8, usable_w - prefix)))
+
+        for wi, (chunk, chunk_urls, chunk_btns) in enumerate(wrapped):
+            if row >= H - 1:
                 break
-            render_msgs.append(i)
-            rows_used += nlines
-            if rows_used >= rows_avail:
-                break
+            is_first = (wi == 0)
+            lines_out.append((ts, user, chunk, is_first))
+            col = margin
 
-        render_msgs.reverse()
-        oldest_idx = render_msgs[0] if render_msgs else newest_idx
-        self._last_msg_range     = (oldest_idx, newest_idx)
-        self._last_visible_count = len(render_msgs)
+            def _draw_segment(txt, base_attr,
+                               url_ranges=chunk_urls, btn_ranges=chunk_btns):
+                nonlocal col
+                spans = sorted(
+                    [(s, e, "url", uv)  for s, e, uv    in url_ranges] +
+                    [(s, e, "btn", act) for s, e, _, act in btn_ranges],
+                    key=lambda x: x[0],
+                )
+                i2 = 0
+                for ss, se, kind, action in spans:
+                    if col >= W - 1: break
+                    if ss > i2:
+                        plain = _cols_slice(txt[i2:ss], max(0, W - col - 1))
+                        try: w.addstr(row, col, plain, base_attr)
+                        except curses.error: pass
+                        col += _str_cols(plain)
+                    seg = _cols_slice(txt[ss:se], max(0, W - col - 1))
+                    focused_val = (_msg_interactables[self.btn_cursor % len(_msg_interactables)][0]
+                                   if is_sel and _msg_interactables else None)
+                    if kind == "url":
+                        seg_attr = (base_attr | curses.A_UNDERLINE | curses.A_REVERSE
+                                    if is_sel and action == focused_val
+                                    else base_attr | curses.A_UNDERLINE)
+                    else:
+                        seg_attr = (base_attr | curses.A_BOLD | curses.A_REVERSE
+                                    if is_sel and action == focused_val
+                                    else base_attr | curses.A_BOLD)
+                    try: w.addstr(row, col, seg, seg_attr)
+                    except curses.error: pass
+                    col += _str_cols(seg)
+                    i2  = se
+                if i2 < len(txt) and col < W - 1:
+                    plain = _cols_slice(txt[i2:], max(0, W - col - 1))
+                    try: w.addstr(row, col, plain, base_attr)
+                    except curses.error: pass
+                    col += _str_cols(plain)
 
-        if self.scroll_cursor >= 0:
-            self.scroll_cursor = max(oldest_idx, min(newest_idx, self.scroll_cursor))
-
-        row = max(0, H - 1 - rows_used)
-        lines_out_compat: List[tuple] = []
-
-        for mi in render_msgs:
-            msg     = self.messages[mi]
-            ts, user, msg_content = msg["ts"], msg["user"], msg["content"]
-            is_sel  = (self.scroll_cursor == mi)
-            sel_a   = curses.color_pair(C_MSG_SELECT)
-            qt_a    = curses.color_pair(C_TIMESTAMP)
-
-            # Quoted line — single line, truncated with … to fit
-            qdata = msg.get("quoted")
-            if qdata and row < H - 1:
-                q_ts     = qdata.get("ts", "")
-                q_prefix = f"  ↩ {qdata['user']}"
-                if q_ts:
-                    q_prefix += f" [{q_ts}]"
-                q_prefix += ": "
-                # How much space is left for the quoted text itself
-                avail = max(4, W - margin - len(q_prefix) - 1)
-                q_text = qdata['text'].replace('\n', ' ').strip()
-                if len(q_text) > avail:
-                    q_text = q_text[:avail - 1] + '…'
-                q_line = q_prefix + q_text
-                try:
+            try:
+                if is_sel:
+                    w.addstr(row, 0, " " * (W - 1), sel_a)
+                if is_first:
+                    ts_a = sel_a if is_sel else curses.color_pair(C_TIMESTAMP)
+                    w.addstr(row, col, f"{ts} ", ts_a)
+                    col += len(ts) + 1
                     if is_sel:
-                        w.addstr(row, 0, " " * (W - 1), sel_a)
-                    w.addstr(row, margin, q_line[:max(0, W - margin - 1)],
-                             sel_a if is_sel else qt_a)
-                except curses.error:
-                    pass
-                lines_out_compat.append((ts, user, q_line, False))
-                row += 1
-
-            # Message lines
-            prefix  = len(ts) + 1 + len(user) + 2
-            # Build wrapped chunks with pre-computed URL and button spans.
-            # Buttons [[title/action]] are replaced with [title] for display.
-            # All spans are computed on the display string before wrapping.
-            def _wrap_with_spans(line, width):
-                btn_matches = list(BUTTON_RE.finditer(line))
-                display     = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', line)
-                # Compute button spans in display space
-                btn_display_spans = []
-                offset = 0
-                for m in btn_matches:
-                    title, action = m.group(1), m.group(2)
-                    shrink  = (m.end() - m.start()) - (len(title) + 2)
-                    d_start = m.start() - offset
-                    btn_display_spans.append((d_start, d_start + len(title) + 2, title, action))
-                    offset += shrink
-                url_spans = [(m.start(), m.end(), m.group()) for m in URL_RE.finditer(display)]
-                chunks = _cols_aware_wrap(display, width)
-                result = []
-                orig_pos = 0
-                for ch in chunks:
-                    ci = display.find(ch, orig_pos)
-                    if ci == -1: ci = orig_pos
-                    ch_end   = ci + len(ch)
-                    orig_pos = ch_end
-                    ch_urls  = []
-                    for us, ue, uval in url_spans:
-                        os2, oe2 = max(us, ci), min(ue, ch_end)
-                        if os2 < oe2: ch_urls.append((os2 - ci, oe2 - ci, uval))
-                    ch_btns  = []
-                    for ds, de, title, action in btn_display_spans:
-                        os2, oe2 = max(ds, ci), min(de, ch_end)
-                        if os2 < oe2: ch_btns.append((os2 - ci, oe2 - ci, title, action))
-                    result.append((ch, ch_urls, ch_btns))
-                return result
-            # Collect all interactables (buttons+URLs) for this message for cycling
-            _msg_interactables = (
-                [(a, 'btn') for _, a in [(m.group(1), m.group(2)) for m in BUTTON_RE.finditer(msg_content)]]
-                + [(u, 'url') for u in URL_RE.findall(BUTTON_RE.sub('', msg_content))]
-            )
-            wrapped = []
-            for _ln in msg_content.split("\n"):
-                wrapped.extend(_wrap_with_spans(_ln, max(8, usable_w - prefix)))
-
-            for wi, (chunk, chunk_urls, chunk_btns) in enumerate(wrapped):
-                if row >= H - 1:
-                    break
-                is_first = (wi == 0)
-                lines_out_compat.append((ts, user, chunk, is_first))
-                col = margin
-                try:
-                    if is_sel:
-                        w.addstr(row, 0, " " * (W - 1), sel_a)
-                    if is_first:
-                        ts_a = sel_a if is_sel else curses.color_pair(C_TIMESTAMP)
-                        w.addstr(row, col, f"{ts} ", ts_a)
-                        col += len(ts) + 1
-                        if is_sel:
-                            ua = sel_a | curses.A_BOLD
+                        ua = sel_a | curses.A_BOLD
+                    else:
+                        hex_col = msg.get("col", "")
+                        if hex_col:
+                            ua = curses.color_pair(self._hex_colour_pair(hex_col)) | curses.A_BOLD
+                        elif user == own_username:
+                            ua = curses.color_pair(C_SELF) | curses.A_BOLD
                         else:
-                            hex_col = msg.get('col', '')
-                            if hex_col:
-                                ua = curses.color_pair(self._hex_colour_pair(hex_col)) | curses.A_BOLD
-                            elif user == own_username:
-                                ua = curses.color_pair(C_SELF) | curses.A_BOLD
-                            else:
-                                ua = curses.color_pair(C_USERNAME) | curses.A_BOLD
-                        w.addstr(row, col, user, ua)
-                        col += len(user)
-                        w.addstr(row, col, ": ",
-                                 sel_a if is_sel else curses.color_pair(C_TIMESTAMP))
-                        col += 2
-                    else:
-                        col += prefix
+                            ua = curses.color_pair(C_USERNAME) | curses.A_BOLD
+                    w.addstr(row, col, user, ua)
+                    col += len(user)
+                    w.addstr(row, col, ": ",
+                             sel_a if is_sel else curses.color_pair(C_TIMESTAMP))
+                    col += 2
+                else:
+                    col += prefix
 
-                    # Draw chunk: highlight @mention in red, URLs underlined
-                    remaining = chunk[:max(0, W - col - 1)]
+                remaining = chunk[:max(0, W - col - 1)]
+                if not is_sel and own_username and f"@{own_username}" in remaining:
+                    needle = f"@{own_username}"
+                    i2, txt2 = 0, remaining
+                    while i2 < len(txt2) and col < W - 1:
+                        pos = txt2.find(needle, i2)
+                        if pos == -1:
+                            _draw_segment(txt2[i2:], 0)
+                            break
+                        if pos > i2:
+                            _draw_segment(txt2[i2:pos], 0)
+                        mention = needle[:max(0, W - col - 1)]
+                        try: w.addstr(row, col, mention,
+                                      curses.color_pair(C_ERROR) | curses.A_BOLD)
+                        except curses.error: pass
+                        col += len(needle)
+                        i2 = pos + len(needle)
+                else:
+                    _draw_segment(remaining, sel_a if is_sel else 0)
+            except curses.error:
+                pass
+            row += 1
 
-                    def _draw_segment(txt, base_attr,
-                                      url_ranges=chunk_urls, btn_ranges=chunk_btns):
-                        """Draw txt with URLs underlined and buttons bold."""
-                        nonlocal col
-                        # Merge url and btn spans, sorted by start position
-                        spans = sorted(
-                            [(s, e, 'url', uv) for s, e, uv in url_ranges] +
-                            [(s, e, 'btn', a)  for s, e, _, a in btn_ranges],
-                            key=lambda x: x[0]
-                        )
-                        i2 = 0
-                        for ss, se, kind, action in spans:
-                            if col >= W - 1: break
-                            if ss > i2:
-                                plain = _cols_slice(txt[i2:ss], max(0, W - col - 1))
-                                try: w.addstr(row, col, plain, base_attr)
-                                except curses.error: pass
-                                col += _str_cols(plain)
-                            seg = _cols_slice(txt[ss:se], max(0, W - col - 1))
-                            focused_val = (_msg_interactables[self.btn_cursor][0]
-                                           if is_sel and _msg_interactables else None)
-                            if kind == 'url':
-                                if is_sel and action == focused_val:
-                                    seg_attr = base_attr | curses.A_UNDERLINE | curses.A_REVERSE
-                                else:
-                                    seg_attr = base_attr | curses.A_UNDERLINE
-                            else:  # btn
-                                if is_sel and action == focused_val:
-                                    seg_attr = base_attr | curses.A_BOLD | curses.A_REVERSE
-                                else:
-                                    seg_attr = base_attr | curses.A_BOLD
-                            try: w.addstr(row, col, seg, seg_attr)
-                            except curses.error: pass
-                            col += _str_cols(seg)
-                            i2 = se
-                        if i2 < len(txt) and col < W - 1:
-                            plain = _cols_slice(txt[i2:], max(0, W - col - 1))
-                            try: w.addstr(row, col, plain, base_attr)
-                            except curses.error: pass
-                            col += _str_cols(plain)
+        # ── Reaction bar ──────────────────────────────────────────────
+        reactions = msg.get("reactions", {})
+        if reactions and row < H - 1:
+            rbar = "".join(f" {e}×{c} " for e, c in list(reactions.items())[:8])
+            try:
+                if is_sel:
+                    w.addstr(row, 0, " " * (W - 1), sel_a)
+                w.addstr(row, margin, rbar[:max(0, W - margin - 1)],
+                         sel_a if is_sel else curses.color_pair(C_SELF) | curses.A_BOLD)
+            except curses.error:
+                pass
+            lines_out.append((ts, user, rbar, False))
+            row += 1
 
-                    if not is_sel and own_username and f'@{own_username}' in remaining:
-                        needle = f'@{own_username}'
-                        i2, txt2 = 0, remaining
-                        while i2 < len(txt2) and col < W - 1:
-                            pos = txt2.find(needle, i2)
-                            if pos == -1:
-                                _draw_segment(txt2[i2:], 0)
-                                break
-                            if pos > i2:
-                                _draw_segment(txt2[i2:pos], 0)
-                            mention = needle[:max(0, W - col - 1)]
-                            try: w.addstr(row, col, mention,
-                                          curses.color_pair(C_ERROR) | curses.A_BOLD)
-                            except curses.error: pass
-                            col += len(needle)
-                            i2 = pos + len(needle)
-                    else:
-                        _draw_segment(remaining, sel_a if is_sel else 0)
-                except curses.error:
-                    pass
-                row += 1
+        return row
 
-            # Reaction bar
-            reactions = msg.get("reactions", {})
-            if reactions and row < H - 1:
-                rbar = "".join(f" {e}×{c} " for e, c in list(reactions.items())[:8])
-                try:
-                    if is_sel:
-                        w.addstr(row, 0, " " * (W - 1), sel_a)
-                    w.addstr(row, margin, rbar[:max(0, W - margin - 1)],
-                             sel_a if is_sel else curses.color_pair(C_SELF) | curses.A_BOLD)
-                except curses.error:
-                    pass
-                lines_out_compat.append((ts, user, rbar, False))
-                row += 1
-
-        self._last_lines_out = lines_out_compat
-
-        # Status bar — only paint background when there's something to say
+    def _draw_chat_statusbar(
+        self, w, H: int, W: int, total: int, own_username: str,
+    ) -> None:
+        """Paint the status/scroll bar at the bottom of the chat window."""
         if self.scroll_offset or self.scroll_cursor >= 0:
-            pos      = total - self.scroll_offset
+            pos = total - self.scroll_offset
             if self.scroll_cursor >= 0:
-                sel_msg = self.messages[self.scroll_cursor] if 0 <= self.scroll_cursor < len(self.messages) else None
-                sel_content  = sel_msg.get('content', '') if sel_msg else ''
-                has_url  = bool(URL_RE.search(sel_content))
-                has_btn  = bool(BUTTON_RE.search(sel_content))
-                link_hint = "  o=open  ◀▶=cycle" if (has_url or has_btn) else ""
-                is_own = sel_msg and sel_msg.get('user') == own_username
-                del_hint  = "  ⌫=delete" if is_own else ""
-                sel_hint = f"  Spc=quote  e=edit{del_hint}{link_hint}"
+                sel_msg     = (self.messages[self.scroll_cursor]
+                               if 0 <= self.scroll_cursor < len(self.messages) else None)
+                sel_content = sel_msg.get("content", "") if sel_msg else ""
+                link_hint   = "  o=open  ◀▶=cycle" if _get_interactables(sel_content) else ""
+                is_own      = sel_msg and sel_msg.get("user") == own_username
+                del_hint    = "  ⌫=delete" if is_own else ""
+                sel_hint    = f"  Spc=quote  e=edit{del_hint}{link_hint}"
             else:
                 sel_hint = ""
             status_text = f"  ↑ {pos}/{total}{sel_hint}  Shift+↓ bottom"
         elif self.typing_list:
-            names  = ", ".join(self.typing_list[:3])
-            suffix = "…" if len(self.typing_list) > 3 else ""
+            names       = ", ".join(self.typing_list[:3])
+            suffix      = "…" if len(self.typing_list) > 3 else ""
             status_text = f"  ✎ {names}{suffix} typing…"
         else:
-            import time as _time
-            if self.status_until and _time.monotonic() > self.status_until:
+            if self.status_until and time.monotonic() > self.status_until:
                 self.status_msg   = ""
                 self.status_until = 0.0
             status_text = self.status_msg
@@ -1626,6 +1612,58 @@ class ChatUI:
                 w.addstr(H - 1, 0, status_text[:W - 1].ljust(W - 1), sa)
             except curses.error:
                 pass
+
+    def _draw_chat(self, own_username: str) -> None:
+
+        w = self.win_chat
+        w.erase()
+        H, W     = w.getmaxyx()
+        margin   = 2
+        usable_w = max(1, W - margin * 2)
+        self._last_visible_count = 0
+
+        total = len(self.messages)
+        if total == 0:
+            self._last_msg_range = (0, 0)
+            self._last_lines_out = []
+            w.noutrefresh()
+            return
+
+        self.scroll_offset = max(0, min(self.scroll_offset, total - 1))
+        newest_idx = total - 1 - self.scroll_offset
+
+        # ── Layout pass: decide which messages fit on screen ──────────
+        rows_avail  = H - 1
+        render_msgs: List[int] = []
+        rows_used   = 0
+        for i in range(newest_idx, -1, -1):
+            nlines = self._msg_line_count(self.messages[i], usable_w)
+            if rows_used + nlines > rows_avail and render_msgs:
+                break
+            render_msgs.append(i)
+            rows_used += nlines
+            if rows_used >= rows_avail:
+                break
+
+        render_msgs.reverse()
+        oldest_idx               = render_msgs[0] if render_msgs else newest_idx
+        self._last_msg_range     = (oldest_idx, newest_idx)
+        self._last_visible_count = len(render_msgs)
+
+        if self.scroll_cursor >= 0:
+            self.scroll_cursor = max(oldest_idx, min(newest_idx, self.scroll_cursor))
+
+        # ── Render pass ───────────────────────────────────────────────
+        row          = max(0, H - 1 - rows_used)
+        lines_out: List[tuple] = []
+        for mi in render_msgs:
+            row = self._draw_message(
+                w, self.messages[mi], mi, row,
+                H, W, margin, usable_w, own_username, lines_out,
+            )
+        self._last_lines_out = lines_out
+
+        self._draw_chat_statusbar(w, H, W, total, own_username)
         w.noutrefresh()
 
     # ── Users sidebar ─────────────────────────────────────────────────
@@ -1654,6 +1692,7 @@ class ChatUI:
             else:
                 out_room.append(session)
         ordered = in_room + out_room
+        self._ordered_users = ordered  # kept in sync for key handler
 
         title = (" ▶ USERS" if focused else "   USERS") + f" — {len(connected_list)}"
         try:
@@ -1677,21 +1716,22 @@ class ChatUI:
             return
         self.user_cursor = max(0, min(self.user_cursor, n - 1))
 
-        # Find row of cursor top within full list to enforce scroll
-        def _row_of(idx):
-            return sum(_rows(ordered[j]) for j in range(idx))
+        # Build prefix-sum of row heights once — O(n) instead of O(n²)
+        row_starts = [0] * (n + 1)
+        for j in range(n):
+            row_starts[j + 1] = row_starts[j] + _rows(ordered[j])
 
-        cursor_row_top = _row_of(self.user_cursor)
-        cursor_row_bot = cursor_row_top + _rows(ordered[self.user_cursor]) - 1
+        cursor_row_top = row_starts[self.user_cursor]
+        cursor_row_bot = row_starts[self.user_cursor + 1] - 1
         viewport_h     = H - 1  # row 0 is title
 
         # Scroll so cursor is visible
-        scroll_row = _row_of(self.user_scroll)
+        scroll_row = row_starts[self.user_scroll]
         if cursor_row_top < scroll_row:
             self.user_scroll = self.user_cursor
         elif cursor_row_bot >= scroll_row + viewport_h:
             # Advance scroll until cursor fits
-            while _row_of(self.user_scroll) + viewport_h <= cursor_row_bot:
+            while row_starts[self.user_scroll] + viewport_h <= cursor_row_bot:
                 self.user_scroll = min(self.user_scroll + 1, n - 1)
 
         # Draw from user_scroll
@@ -1886,8 +1926,7 @@ class ChatUI:
         # Fire when within 5 messages of the oldest loaded
         if self.scroll_offset >= max(0, len(self.messages) - 5):
             self.history_fetching = True
-            import asyncio as _aio
-            _aio.ensure_future(self._history_fetch_cb())
+            asyncio.ensure_future(self._history_fetch_cb())
 
     def scroll_down(self, n: int = 1) -> None:
         self.scroll_offset = max(0, self.scroll_offset - n)
@@ -2012,28 +2051,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             mid = m.get("id", 0)
             if mid and mid in existing_ids:
                 continue
-            uo  = m.get("user", {})
-            usr = uo.get("username", "?") if isinstance(uo, dict) else str(uo)
-            txt = _strip_tags(m.get("content") or m.get("formatted") or "")
-            if not txt:
-                continue
-            pl2     = uo.get("data", {}).get("plugins", {}) if isinstance(uo, dict) else {}
-            hx2     = pl2.get("custom", {}).get("color", "") or pl2.get("color", "")
-            col2    = hx2 or ""
-            quoted_h = None
-            q = m.get("quoted")
-            if q and isinstance(q, dict):
-                qu = q.get("user", {})
-                qn = qu.get("username", "?") if isinstance(qu, dict) else str(qu)
-                qt = _strip_tags(q.get("content") or q.get("formatted") or "")
-                q_ts2 = _parse_msg_ts(q) if any(q.get(k) for k in
-                        ('date','createdTimestamp','createdAt','timestamp','time','created_at')) else ""
-                quoted_h = {"user": qn, "text": qt, "ts": q_ts2}
-            prepend.append({
-                "ts": _parse_msg_ts(m), "user": usr, "content": txt,
-                "id": mid, "col": col2, "quoted": quoted_h,
-                "reactions": _parse_reactions(m.get("storage", {})),
-            })
+            entry = ChatUI._msg_to_entry(m, storage=m.get("storage"))
+            if entry:
+                prepend.append(entry)
         # Release fetching lock
         ui.history_fetching = False
         if prepend:
@@ -2073,8 +2093,6 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     @client.on("reconnected")
     def _on_reced(_): ui.set_status("Reconnected ✓", ttl=4.0)
 
-    @client.on("room-list")
-    def _on_rooms(_): pass
 
     async def _fetch_more_history():
         """Fetch older messages. Tries /messagehistory <oldest_id> first."""
@@ -2165,6 +2183,277 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.room_cursor = i
             break
 
+    # ── Key handlers ─────────────────────────────────────────────────
+
+    async def _handle_menu_key(key) -> bool:
+        """Handle a keypress while the menu is open. Returns True to exit the loop."""
+        if ui.colour_pick_open:
+            n = len(ui.colour_list)
+            if key == curses.KEY_UP:
+                ui.colour_pick_cursor = max(0, ui.colour_pick_cursor - 1)
+            elif key == curses.KEY_DOWN:
+                ui.colour_pick_cursor = min(n - 1, ui.colour_pick_cursor + 1)
+            elif key in (curses.KEY_ENTER, '\n', '\r', 10):
+                entry   = ui.colour_list[ui.colour_pick_cursor]
+                cid     = entry.get('id')
+                hex_val = entry.get('value', '')
+                await client.send_message(f'/custom use color:{cid}')
+                try:
+                    plugins = client._user.setdefault('data', {}).setdefault('plugins', {})
+                    plugins.setdefault('custom', {})['color'] = hex_val
+                except Exception:
+                    pass
+                own    = client.current_user.get('username', '')
+                own_id = client.current_user.get('id')
+                old_hex = client._user.get('data', {}).get('plugins', {}).get('custom', {}).get('color', '')
+                if old_hex:
+                    ui._colour_pair_cache.pop(old_hex.lower().lstrip('#'), None)
+                client._user.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
+                for m in ui.messages:
+                    if m.get('user') == own:
+                        m['col'] = hex_val
+                for session in client._connected_list:
+                    u = session.get('user', {})
+                    if isinstance(u, dict) and u.get('id') == own_id:
+                        u.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
+                        break
+                ui.colour_pick_open = False
+                ui.menu_open = False
+                ui.set_status(f'Colour set to {entry.get("name", cid)}', ttl=3.0)
+            elif key in ('', curses.KEY_BACKSPACE, 127, '', 8):
+                ui.colour_pick_open = False
+            return False
+
+        # Main menu
+        menu_items_count = 5
+        if key == curses.KEY_UP:
+            ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
+        elif key == curses.KEY_DOWN:
+            ui.menu_cursor = (ui.menu_cursor + 1) % menu_items_count
+        elif key in (curses.KEY_ENTER, '\n', '\r', 10):
+            if ui.menu_cursor == 0:   # Cycle theme
+                idx = (THEME_NAMES.index(_active_theme) + 1) % len(THEME_NAMES)
+                _apply_theme(THEME_NAMES[idx])
+                ui.set_status(f'Theme: {_active_theme}', ttl=2.0)
+            elif ui.menu_cursor == 1:  # Toggle notifications
+                ui.notifications_enabled = not ui.notifications_enabled
+                _save_config({'notifications': ui.notifications_enabled})
+                ui.set_status(f'Notifications {"ON" if ui.notifications_enabled else "OFF"}', ttl=2.0)
+            elif ui.menu_cursor == 2:  # Pick colour
+                if ui.colour_list:
+                    ui.colour_pick_open   = True
+                    ui.colour_pick_cursor = 0
+                else:
+                    ui.set_status('✗  Colour list not yet received', ttl=3.0)
+            elif ui.menu_cursor == 3:  # Logout
+                ui.menu_open = False
+                _save_config({'token': None, 'username': ''})
+                client._running = False
+                conn_task.cancel()
+                return True
+            elif ui.menu_cursor == 4:  # Quit
+                ui.menu_open = False
+                client._running = False
+                conn_task.cancel()
+                return True
+        return False
+
+    async def _handle_rooms_key(key) -> None:
+        """Handle a keypress while the ROOMS sidebar is focused."""
+        if key == curses.KEY_UP:
+            ui.sidebar_move(-1, len(rooms_list))
+        elif key == curses.KEY_DOWN:
+            ui.sidebar_move(+1, len(rooms_list))
+        elif key in (curses.KEY_ENTER, '\n', '\r', 10):
+            if rooms_list and 0 <= ui.room_cursor < len(rooms_list):
+                _rid = rooms_list[ui.room_cursor]["id"]
+                ui.unread.pop(_rid, None)
+                await client.join(_rid)
+                ui.focus = Focus.INPUT
+        elif key in (curses.KEY_BACKSPACE, 127, '', 8):
+            if rooms_list and 0 <= ui.room_cursor < len(rooms_list):
+                room = rooms_list[ui.room_cursor]
+                if room.get("isPrivate", False):
+                    await client.send_message(f"/join {room['id']}")
+                    await asyncio.sleep(0.3)
+                    await client.send_message(f"/pmleave {room['id']}")
+                    ui.set_status(f"Left {room.get('name', room['id'])}", ttl=3.0)
+                else:
+                    ui.set_status("✗  Can't leave public rooms", ttl=2.0)
+
+    async def _handle_users_key(key) -> None:
+        """Handle a keypress while the USERS sidebar is focused."""
+        ordered = ui._ordered_users
+        if key == curses.KEY_UP:
+            ui.sidebar_move(-1, len(ordered))
+        elif key == curses.KEY_DOWN:
+            ui.sidebar_move(+1, len(ordered))
+        elif key in (curses.KEY_ENTER, '\n', '\r', 10):
+            if ordered and 0 <= ui.user_cursor < len(ordered):
+                target = ordered[ui.user_cursor].get("user", {}).get("username", "")
+                if target and target != client.current_user.get("username"):
+                    ui.messages.clear()
+                    ui.scroll_offset = 0
+                    ui.scroll_cursor = -1
+                    ui._last_msg_range = (0, 0)
+                    ui.reset_history_state()
+                    ui.set_status(f"Opening DM with {target}…", ttl=5.0)
+                    asyncio.ensure_future(client.open_dm(target))
+                ui.focus = Focus.INPUT
+
+    async def _handle_input_key(key) -> bool:
+        """Handle a keypress while the INPUT box is focused. Returns True to exit the loop."""
+        _enter = (curses.KEY_ENTER, '\n', '\r', 10)
+        _bksp  = (curses.KEY_BACKSPACE, 127, '', 8)
+
+        def _selected_msg():
+            if 0 <= ui.scroll_cursor < len(ui.messages):
+                return ui.messages[ui.scroll_cursor]
+            return None
+
+        if key in (' ', 32) and (ui.scroll_offset > 0 or ui.scroll_cursor >= 0):
+            msg = _selected_msg()
+            if msg and msg.get("id"):
+                ref = f"@{msg['id']} "
+                ui.input_buf  = ref + ui.input_buf
+                ui.cursor_pos = len(ref)
+            ui.scroll_cursor_clear()
+            ui.scroll_bottom()
+
+        elif key in _enter:
+            text = ui.consume_input().strip()
+            if text == "/quit":
+                return True
+            elif text.startswith("/join "):
+                parts = text.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    await client.join(int(parts[1]))
+                else:
+                    ui.set_status("Usage: /join <room_id>")
+            elif text == "/rooms":
+                ui.set_status("  ".join(
+                    f"[{r['id']}]{r.get('name','?')}" for r in client.rooms
+                ) or "No rooms")
+            elif text == "/who":
+                ui.set_status("Online: " + ", ".join(
+                    s.get("user", {}).get("username", "?") for s in client._connected_list
+                ))
+            elif text in ("/history", "/messagehistory"):
+                await client.send_message("/messagehistory")
+            elif text:
+                if client._typing_active:
+                    client._typing_active = False
+                    if client._typing_task:
+                        client._typing_task.cancel()
+                    await client.send_message("/t off")
+                await client.send_message(text)
+
+        elif key == curses.KEY_UP:
+            oldest, newest = ui._last_msg_range
+            if ui.scroll_cursor >= 0:
+                if ui.scroll_cursor <= oldest:
+                    ui.scroll_up(1)
+                else:
+                    ui.scroll_cursor -= 1
+            else:
+                ui.scroll_cursor = newest
+
+        elif key == curses.KEY_DOWN:
+            oldest, newest = ui._last_msg_range
+            if ui.scroll_cursor >= 0:
+                if ui.scroll_cursor >= newest:
+                    ui.scroll_down(1) if ui.scroll_offset > 0 else ui.scroll_cursor_clear()
+                else:
+                    ui.scroll_cursor += 1
+                    ui.btn_cursor = 0
+            else:
+                ui.scroll_down(1)
+
+        elif key in ('e', 'E') and ui.scroll_cursor >= 0:
+            msg = _selected_msg()
+            if msg and msg.get("id") and msg.get("user") == client.current_user.get("username"):
+                ui.input_buf  = f"/edit {msg['id']} {msg['content']}"
+                ui.cursor_pos = len(ui.input_buf)
+                ui.scroll_cursor_clear()
+                ui.scroll_bottom()
+            elif msg:
+                ui.set_status("✗  Can only edit your own messages", ttl=2.0)
+
+        elif key in ('o', 'O') and ui.scroll_cursor >= 0:
+            msg = _selected_msg()
+            if msg:
+                _ias = _get_interactables(msg.get('content', ''))
+                if _ias:
+                    _val, _kind = _ias[ui.btn_cursor % len(_ias)]
+                    if _kind == 'url' or _val.startswith('http'):
+                        webbrowser.open(_val)
+                        ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
+                    else:
+                        asyncio.ensure_future(client.send_message(_val))
+                        ui.set_status(f'▶  Sent: {_val[:50]}', ttl=2.0)
+                else:
+                    ui.set_status('No links or buttons in this message', ttl=2.0)
+
+        elif key == curses.KEY_SF:
+            ui.scroll_bottom(); ui.scroll_cursor_clear()
+        elif key == curses.KEY_SR:
+            ui.scroll_up(5)
+
+        elif key in _bksp:
+            msg = _selected_msg()
+            if ui.scroll_cursor >= 0 and msg:
+                if msg.get('id') and msg.get('user') == client.current_user.get('username'):
+                    await client.send_message(f"/delete {msg['id']}")
+                    ui.set_status('✓  Message deleted', ttl=2.0)
+                    ui.scroll_cursor_clear()
+                    ui.scroll_bottom()
+                else:
+                    ui.set_status('✗  Can only delete your own messages', ttl=2.0)
+            else:
+                ui.backspace()
+
+        elif key == curses.KEY_DC:
+            if ui.scroll_cursor < 0:
+                ui.delete_char()
+
+        elif key == curses.KEY_LEFT:
+            if ui.scroll_cursor >= 0:
+                msg = _selected_msg()
+                if msg:
+                    _ias = _get_interactables(msg.get("content", ""))
+                    if _ias:
+                        ui.btn_cursor = (ui.btn_cursor - 1) % len(_ias)
+            else:
+                ui.move_cursor(-1)
+
+        elif key == curses.KEY_RIGHT:
+            if ui.scroll_cursor >= 0:
+                msg = _selected_msg()
+                if msg:
+                    _ias = _get_interactables(msg.get("content", ""))
+                    if _ias:
+                        ui.btn_cursor = (ui.btn_cursor + 1) % len(_ias)
+            else:
+                ui.move_cursor(+1)
+
+        elif key == curses.KEY_HOME:
+            if ui.scroll_cursor < 0:
+                ui.home()
+        elif key == curses.KEY_END:
+            if ui.scroll_cursor < 0:
+                ui.end()
+
+        elif isinstance(key, str) and key.isprintable():
+            if ui.scroll_cursor < 0:
+                ui.insert_char(key)
+                asyncio.ensure_future(client.notify_typing())
+        elif isinstance(key, int) and 32 <= key < 127:
+            if ui.scroll_cursor < 0:
+                ui.insert_char(chr(key))
+                asyncio.ensure_future(client.notify_typing())
+
+        return False
+
     # ── Main loop ─────────────────────────────────────────────────────
 
     while True:
@@ -2222,87 +2511,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         # Route keys to menu when open
         if ui.menu_open:
-            # Colour picker sub-menu
-            if ui.colour_pick_open:
-                n = len(ui.colour_list)
-                if key == curses.KEY_UP:
-                    ui.colour_pick_cursor = max(0, ui.colour_pick_cursor - 1)
-                elif key == curses.KEY_DOWN:
-                    ui.colour_pick_cursor = min(n - 1, ui.colour_pick_cursor + 1)
-                elif key in (curses.KEY_ENTER, '\n', '\r', 10):
-                    entry   = ui.colour_list[ui.colour_pick_cursor]
-                    cid     = entry.get('id')
-                    hex_val = entry.get('value', '')
-                    await client.send_message(f'/custom use color:{cid}')
-                    # Update local user data immediately so chat re-renders with new colour
-                    try:
-                        plugins = client._user.setdefault('data', {}).setdefault('plugins', {})
-                        plugins.setdefault('custom', {})['color'] = hex_val
-                    except Exception:
-                        pass
-                    # Update local user data, messages, and connected-list immediately
-                    own = client.current_user.get('username', '')
-                    own_id = client.current_user.get('id')
-                    # Invalidate cached hex pair (read from custom.color, not top-level color)
-                    old_hex = client._user.get('data', {}).get('plugins', {}).get('custom', {}).get('color', '')
-                    if old_hex:
-                        old_key = old_hex.lower().lstrip('#')
-                        ui._colour_pair_cache.pop(old_key, None)
-                    # Update own user object (custom.color is what /custom use sets)
-                    client._user.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
-                    # Update messages
-                    for m in ui.messages:
-                        if m.get('user') == own:
-                            m['col'] = hex_val
-                    # Update connected-list entry
-                    for session in client._connected_list:
-                        u = session.get('user', {})
-                        if isinstance(u, dict) and u.get('id') == own_id:
-                            u.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
-                            break
-                    ui.colour_pick_open = False
-                    ui.menu_open = False
-                    ui.set_status(f'Colour set to {entry.get("name", cid)}', ttl=3.0)
-                elif key == '\x1b':
-                    ui.colour_pick_open = False
-                elif key in (curses.KEY_BACKSPACE, 127, '\x7f', 8):
-                    ui.colour_pick_open = False
-                continue
-
-            # Main menu
-            menu_items_count = 5
-            if key == curses.KEY_UP:
-                ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
-            elif key == curses.KEY_DOWN:
-                ui.menu_cursor = (ui.menu_cursor + 1) % menu_items_count
-            elif key in (curses.KEY_ENTER, '\n', '\r', 10):
-                if ui.menu_cursor == 0:   # Cycle theme
-                    idx = (THEME_NAMES.index(_active_theme) + 1) % len(THEME_NAMES)
-                    _apply_theme(THEME_NAMES[idx])
-                    ui.set_status(f'Theme: {_active_theme}', ttl=2.0)
-                elif ui.menu_cursor == 1:  # Toggle notifications
-                    ui.notifications_enabled = not ui.notifications_enabled
-                    _save_config({'notifications': ui.notifications_enabled})
-                    ui.set_status(
-                        f'Notifications {"ON" if ui.notifications_enabled else "OFF"}',
-                        ttl=2.0)
-                elif ui.menu_cursor == 2:  # Pick colour
-                    if ui.colour_list:
-                        ui.colour_pick_open   = True
-                        ui.colour_pick_cursor = 0
-                    else:
-                        ui.set_status('✗  Colour list not yet received', ttl=3.0)
-                elif ui.menu_cursor == 3:  # Logout
-                    ui.menu_open = False
-                    _save_config({'token': None, 'username': ''})
-                    client._running = False
-                    conn_task.cancel()
-                    break
-                elif ui.menu_cursor == 4:  # Quit
-                    ui.menu_open = False
-                    client._running = False
-                    conn_task.cancel()
-                    break
+            if await _handle_menu_key(key):
+                break
             continue
 
         if key == '\t':
@@ -2317,208 +2527,12 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             if users_list: ui.user_cursor = min(ui.user_cursor, len(users_list) - 1)
             continue
 
-        # ROOMS focus
         if ui.focus == Focus.ROOMS:
-            if key == curses.KEY_UP:
-                ui.sidebar_move(-1, len(rooms_list))
-            elif key == curses.KEY_DOWN:
-                ui.sidebar_move(+1, len(rooms_list))
-            elif key in (curses.KEY_ENTER, '\n', '\r', 10):
-                if rooms_list and 0 <= ui.room_cursor < len(rooms_list):
-                    _rid = rooms_list[ui.room_cursor]["id"]
-                    ui.unread.pop(_rid, None)
-                    await client.join(_rid)
-                    ui.focus = Focus.INPUT
-            elif key in (curses.KEY_BACKSPACE, 127, '\x7f', 8):
-                # Leave only private rooms (DMs/group chats), not public rooms
-                if rooms_list and 0 <= ui.room_cursor < len(rooms_list):
-                    room = rooms_list[ui.room_cursor]
-                    if room.get("isPrivate", False):
-                        # Join first (server requires membership), then leave
-                        await client.send_message(f"/join {room['id']}")
-                        await asyncio.sleep(0.3)
-                        await client.send_message(f"/pmleave {room['id']}")
-                        ui.set_status(f"Left {room.get('name', room['id'])}", ttl=3.0)
-                    else:
-                        ui.set_status("✗  Can't leave public rooms", ttl=2.0)
-
-        # USERS focus
+            await _handle_rooms_key(key)
         elif ui.focus == Focus.USERS:
-            if key == curses.KEY_UP:
-                ui.sidebar_move(-1, len(users_list))
-            elif key == curses.KEY_DOWN:
-                ui.sidebar_move(+1, len(users_list))
-            elif key in (curses.KEY_ENTER, '\n', '\r', 10):
-                if users_list and 0 <= ui.user_cursor < len(users_list):
-                    target = users_list[ui.user_cursor].get("user", {}).get("username", "")
-                    if target and target != client.current_user.get("username"):
-                        await client.open_dm(target)
-                        ui.set_status(f"Opened DM with {target}", ttl=3.0)
-                    ui.focus = Focus.INPUT
-
-        # INPUT focus
-        else:
-            if key in (' ', 32) and (ui.scroll_offset > 0 or ui.scroll_cursor >= 0):
-                msg = (ui.messages[ui.scroll_cursor]
-                       if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                if msg and msg.get("id"):
-                    ref = f"@{msg['id']} "
-                    ui.input_buf  = ref + ui.input_buf
-                    ui.cursor_pos = len(ref)
-                ui.scroll_cursor_clear()
-                ui.scroll_bottom()
-
-            elif key in (curses.KEY_ENTER, '\n', '\r', 10):
-                text = ui.consume_input().strip()
-                if not text:
-                    pass
-                elif text == "/quit":
-                    break
-                elif text.startswith("/join "):
-                    parts = text.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        await client.join(int(parts[1]))
-                    else:
-                        ui.set_status("Usage: /join <room_id>")
-                elif text == "/rooms":
-                    ui.set_status("  ".join(
-                        f"[{r['id']}]{r.get('name','?')}" for r in client.rooms
-                    ) or "No rooms")
-                elif text == "/who":
-                    ui.set_status("Online: " + ", ".join(
-                        s.get("user", {}).get("username", "?")
-                        for s in client._connected_list
-                    ))
-                elif text in ("/history", "/messagehistory"):
-                    await client.send_message("/messagehistory")
-                else:
-                    if client._typing_active:
-                        client._typing_active = False
-                        if client._typing_task:
-                            client._typing_task.cancel()
-                        await client.send_message("/t off")
-                    await client.send_message(text)
-
-            elif key == curses.KEY_UP:
-                oldest, newest = ui._last_msg_range
-                if ui.scroll_cursor >= 0:
-                    if ui.scroll_cursor <= oldest:
-                        ui.scroll_up(1)
-                    else:
-                        ui.scroll_cursor -= 1
-                else:
-                    ui.scroll_cursor = newest
-
-            elif key == curses.KEY_DOWN:
-                oldest, newest = ui._last_msg_range
-                if ui.scroll_cursor >= 0:
-                    if ui.scroll_cursor >= newest:
-                        if ui.scroll_offset > 0:
-                            ui.scroll_down(1)
-                        else:
-                            ui.scroll_cursor_clear()
-                    else:
-                        ui.scroll_cursor += 1
-                        ui.btn_cursor = 0
-                else:
-                    ui.scroll_down(1)
-
-            elif key in ('e', 'E') and ui.scroll_cursor >= 0:
-                # Edit selected message — only own messages
-                msg = (ui.messages[ui.scroll_cursor]
-                       if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                if msg and msg.get("id") and msg.get("user") == client.current_user.get("username"):
-                    mid = msg["id"]
-                    ui.input_buf  = f"/edit {mid} {msg['content']}"
-                    ui.cursor_pos = len(ui.input_buf)
-                    ui.scroll_cursor_clear()
-                    ui.scroll_bottom()
-                elif msg:
-                    ui.set_status("✗  Can only edit your own messages", ttl=2.0)
-
-            elif key in ('o', 'O') and ui.scroll_cursor >= 0:
-                # Activate focused interactable in selected message
-                msg = (ui.messages[ui.scroll_cursor]
-                       if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                if msg:
-                    _raw     = msg.get('content', '')
-                    _btns    = [(m.group(2), 'btn') for m in BUTTON_RE.finditer(_raw)]
-                    _urls    = [(u, 'url') for u in URL_RE.findall(BUTTON_RE.sub('', _raw))]
-                    _ias     = _btns + _urls
-                    if _ias:
-                        _idx  = ui.btn_cursor % len(_ias)
-                        _val, _kind = _ias[_idx]
-                        import webbrowser
-                        if _kind == 'url' or _val.startswith('http'):
-                            webbrowser.open(_val)
-                            ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
-                        else:
-                            asyncio.ensure_future(client.send_message(_val))
-                            ui.set_status(f'▶  Sent: {_val[:50]}', ttl=2.0)
-                    else:
-                        ui.set_status('No links or buttons in this message', ttl=2.0)
-
-            elif key == curses.KEY_SF:
-                ui.scroll_bottom()
-                ui.scroll_cursor_clear()
-            elif key == curses.KEY_SR:
-                ui.scroll_up(5)
-            elif key in (curses.KEY_BACKSPACE, 127, '\x7f', 8):
-                if ui.scroll_cursor >= 0:
-                    # Delete own message while browsing history
-                    msg = (ui.messages[ui.scroll_cursor]
-                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                    if msg and msg.get('id') and msg.get('user') == client.current_user.get('username'):
-                        await client.send_message(f"/delete {msg['id']}")
-                        ui.set_status('✓  Message deleted', ttl=2.0)
-                        ui.scroll_cursor_clear()
-                        ui.scroll_bottom()
-                    elif msg:
-                        ui.set_status('✗  Can only delete your own messages', ttl=2.0)
-                else:
-                    ui.backspace()
-            elif key == curses.KEY_DC:
-                if ui.scroll_cursor < 0:
-                    ui.delete_char()
-            elif key == curses.KEY_LEFT:
-                if ui.scroll_cursor >= 0:
-                    # Cycle interactables backwards
-                    msg = (ui.messages[ui.scroll_cursor]
-                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                    if msg:
-                        _btns = [(m.group(2), "btn") for m in BUTTON_RE.finditer(msg.get("content", ""))]
-                        _urls = [(u, "url") for u in URL_RE.findall(BUTTON_RE.sub("", msg.get("content", "")))]
-                        _ias  = _btns + _urls
-                        if _ias:
-                            ui.btn_cursor = (ui.btn_cursor - 1) % len(_ias)
-                else:
-                    ui.move_cursor(-1)
-            elif key == curses.KEY_RIGHT:
-                if ui.scroll_cursor >= 0:
-                    msg = (ui.messages[ui.scroll_cursor]
-                           if 0 <= ui.scroll_cursor < len(ui.messages) else None)
-                    if msg:
-                        _btns = [(m.group(2), "btn") for m in BUTTON_RE.finditer(msg.get("content", ""))]
-                        _urls = [(u, "url") for u in URL_RE.findall(BUTTON_RE.sub("", msg.get("content", "")))]
-                        _ias  = _btns + _urls
-                        if _ias:
-                            ui.btn_cursor = (ui.btn_cursor + 1) % len(_ias)
-                else:
-                    ui.move_cursor(+1)
-            elif key == curses.KEY_HOME:
-                if ui.scroll_cursor < 0:
-                    ui.home()
-            elif key == curses.KEY_END:
-                if ui.scroll_cursor < 0:
-                    ui.end()
-            elif isinstance(key, str) and key.isprintable():
-                if ui.scroll_cursor < 0:
-                    ui.insert_char(key)
-                    asyncio.ensure_future(client.notify_typing())
-            elif isinstance(key, int) and 32 <= key < 127:
-                if ui.scroll_cursor < 0:
-                    ui.insert_char(chr(key))
-                    asyncio.ensure_future(client.notify_typing())
+            await _handle_users_key(key)
+        elif await _handle_input_key(key):
+            break
 
         await asyncio.sleep(0.02)
 
