@@ -1,6 +1,6 @@
 # skychat-tui
 
-Vibe coded terminal client for [skych.at](https://skych.at), built with Python and curses. Uses less RAM than bpytop.
+Terminal client for [skych.at](https://skych.at), built with Python and curses.
 
 ## Install
 
@@ -55,7 +55,8 @@ Tab cycles focus between the three panels. The active panel is indicated by a `�
 | `Shift+↓` | Snap back to bottom |
 | `Space` (while scrolled) | Quote selected message — prefills `@<id>` in input |
 | `e` (while scrolled) | Edit selected message (own messages only) |
-| `o` (while scrolled) | Open all URLs in the selected message in the browser |
+| `◀▶` (while scrolled) | Cycle between URLs/buttons |
+| `o` (while scrolled) | Open URLs in default browser/Activate buttons |
 | `Esc` | Open/close menu |
 
 ### Input editing
