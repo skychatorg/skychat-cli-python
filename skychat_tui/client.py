@@ -1852,6 +1852,7 @@ class ChatUI:
         self._last_visible_count: int            = 0
         self._last_lines_out:     list           = []
         self._last_msg_range:     tuple          = (0, 0)
+        self._last_skip_top:      int            = 0   # lines clipped from topmost msg
 
         # History lazy-loading
         self.history_exhausted:  bool             = False
@@ -2437,7 +2438,6 @@ class ChatUI:
     ) -> None:
         """Paint the status/scroll bar at the bottom of the chat window."""
         if self.scroll_offset or self.scroll_cursor >= 0:
-            pos = total - self.scroll_offset
             if self.scroll_cursor >= 0:
                 sel_msg     = (self.messages[self.scroll_cursor]
                                if 0 <= self.scroll_cursor < len(self.messages) else None)
@@ -2448,6 +2448,11 @@ class ChatUI:
                 sel_hint    = f"  Spc=quote  e=edit{del_hint}{link_hint}"
             else:
                 sel_hint = ""
+            newest_idx  = max(0, total - 1 - self.scroll_offset)
+            if self.scroll_cursor >= 0:
+                pos = self.scroll_cursor + 1
+            else:
+                pos = newest_idx + 1
             status_text = f"  ↑ {pos}/{total}{sel_hint}  Shift+↓ bottom"
         elif self.typing_list:
             names       = ", ".join(self.typing_list[:3])
@@ -2511,6 +2516,7 @@ class ChatUI:
         oldest_idx               = render_msgs[0] if render_msgs else newest_idx
         self._last_msg_range     = (oldest_idx, newest_idx)
         self._last_visible_count = len(render_msgs)
+        self._last_skip_top      = skip_top
 
         if self.scroll_cursor >= 0:
             self.scroll_cursor = max(oldest_idx, min(newest_idx, self.scroll_cursor))
@@ -2779,18 +2785,19 @@ class ChatUI:
 
     def scroll_up(self, n: int = 1) -> None:
         self.scroll_offset = min(self.scroll_offset + n, max(0, len(self.messages) - 1))
-        self._maybe_fetch_history()
+        # Only fetch more history when we've scrolled to the very top of loaded messages
+        if self._last_msg_range[0] == 0:
+            self._maybe_fetch_history()
 
     def _maybe_fetch_history(self) -> None:
-        """Trigger a history fetch when we're near the top of loaded messages."""
+        """Trigger a history fetch. Only fires when called from _draw_chat
+        with blank space at the top — guarded by history_fetching/exhausted."""
         if self.history_exhausted or self.history_fetching:
             return
         if self._history_fetch_cb is None:
             return
-        # Fire when within 5 messages of the oldest loaded
-        if self.scroll_offset >= max(0, len(self.messages) - 5):
-            self.history_fetching = True
-            asyncio.ensure_future(self._history_fetch_cb())
+        self.history_fetching = True
+        asyncio.ensure_future(self._history_fetch_cb())
 
     def scroll_down(self, n: int = 1) -> None:
         self.scroll_offset = max(0, self.scroll_offset - n)
@@ -2921,7 +2928,33 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         # Release fetching lock
         ui.history_fetching = False
         if prepend:
+            n = len(prepend)
+            was_empty = len(ui.messages) == 0
+
+            # Save the ID of the message currently at the bottom of the viewport
+            # so we can reanchor after prepend without any index arithmetic.
+            anchor_id = None
+            if not was_empty and ui.scroll_offset > 0:
+                newest_idx = max(0, len(ui.messages) - 1 - ui.scroll_offset)
+                anchor_msg = ui.messages[newest_idx] if 0 <= newest_idx < len(ui.messages) else None
+                anchor_id = anchor_msg.get('id') if anchor_msg else None
+
             ui.messages = prepend + ui.messages
+
+            if anchor_id:
+                # Find the anchor message in the new list and recompute scroll_offset
+                # so newest_idx points at the same message as before.
+                for new_idx, m in enumerate(ui.messages):
+                    if m.get('id') == anchor_id:
+                        ui.scroll_offset = max(0, len(ui.messages) - 1 - new_idx)
+                        break
+                # Recompute _last_msg_range from the new scroll_offset so KEY_UP
+                # doesn't use stale indices. newest is the anchor, oldest unknown
+                # until next draw — set to 0 as a safe lower bound.
+                new_newest = max(0, len(ui.messages) - 1 - ui.scroll_offset)
+                ui._last_msg_range = (0, new_newest)
+                ui._last_skip_top = 0
+
             ui.set_status(f"↑ {len(ui.messages)} messages loaded", ttl=2.0)
         else:
             # Server returned nothing new — either truly exhausted or same batch
