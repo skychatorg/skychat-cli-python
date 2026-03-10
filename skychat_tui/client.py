@@ -1822,7 +1822,8 @@ def ncurses_login(stdscr, prefill_username: str = '',
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIDEBAR_W = 22
-INPUT_H   = 3
+INPUT_H   = 3   # minimum input box height (1 border top + 1 text + 1 border bottom)
+INPUT_H_MAX = 7  # maximum input box height (caps at 5 text lines)
 
 
 class ChatUI:
@@ -1833,9 +1834,11 @@ class ChatUI:
         self.status_msg:   str        = ""
         self.status_until: float      = 0.0
 
-        self.input_buf:   str  = ""
-        self.cursor_pos:  int  = 0
-        self._cursor_yx        = None
+        self.input_buf:      str  = ""
+        self.cursor_pos:     int  = 0
+        self._cursor_yx           = None
+        self.input_h:        int  = INPUT_H       # current input box height (dynamic)
+        self.input_vscroll:  int  = 0             # first visible line row in input box
 
         self.focus:         Focus = Focus.INPUT
         self.room_cursor:   int   = 0
@@ -1876,18 +1879,29 @@ class ChatUI:
     def _build_windows(self) -> None:
         H, W      = self.stdscr.getmaxyx()
         chat_w    = max(10, W - SIDEBAR_W * 2)
-        chat_h    = max(4,  H - INPUT_H - 1)
+        chat_h    = max(4,  H - self.input_h - 1)
         sidebar_h = chat_h   # sidebars stop at the same height as the chat pane
 
-        self.win_header = curses.newwin(1,         W,         0,          0)
-        self.win_rooms  = curses.newwin(sidebar_h, SIDEBAR_W, 1,          0)
-        self.win_chat   = curses.newwin(chat_h,    chat_w,    1,          SIDEBAR_W)
-        self.win_input  = curses.newwin(INPUT_H,   chat_w,    1 + chat_h, SIDEBAR_W)
-        self.win_users  = curses.newwin(sidebar_h, SIDEBAR_W, 1,          SIDEBAR_W + chat_w)
+        self.win_header = curses.newwin(1,            W,         0,          0)
+        self.win_rooms  = curses.newwin(sidebar_h,    SIDEBAR_W, 1,          0)
+        self.win_chat   = curses.newwin(chat_h,       chat_w,    1,          SIDEBAR_W)
+        self.win_input  = curses.newwin(self.input_h, chat_w,    1 + chat_h, SIDEBAR_W)
+        self.win_users  = curses.newwin(sidebar_h,    SIDEBAR_W, 1,          SIDEBAR_W + chat_w)
 
         self.H, self.W = H, W
         self.chat_h    = chat_h
         self.chat_w    = chat_w
+
+    def _update_input_height(self) -> bool:
+        """Recompute input_h from current input_buf. Returns True if height changed."""
+        vis_w = max(1, self.chat_w - 4)
+        lines = self.input_buf.split('\n')
+        visual_rows = sum(max(1, (len(ln) + vis_w - 1) // vis_w) for ln in lines)
+        new_h = min(INPUT_H_MAX, max(INPUT_H, visual_rows + 2))  # +2 for borders
+        if new_h != self.input_h:
+            self.input_h = new_h
+            return True
+        return False
 
     def resize(self) -> None:
         # Tell curses the new terminal size first
@@ -1974,7 +1988,7 @@ class ChatUI:
             f"Theme: {_active_theme}",
             f"Notifications: {'ON' if self.notifications_enabled else 'OFF'}",
             f"Image Preview: {'ON' if self.image_preview_enabled else 'OFF'}",
-            "Pick username colour…" if self.colour_list else "Pick colour (not loaded)",
+            "Pick username color…" if self.colour_list else "Pick color (not loaded)",
             "Logout",
             "Quit",
         ]
@@ -2676,50 +2690,105 @@ class ChatUI:
     # ── Input box ─────────────────────────────────────────────────────
 
     def _draw_input(self) -> None:
+        # Rebuild windows if input height changed due to text content
+        if self._update_input_height():
+            self._build_windows()
+
         w = self.win_input
         H, W    = w.getmaxyx()
         focused = self.focus == Focus.INPUT
+        vis_w   = max(1, W - 4)   # usable text width inside borders
+        text_rows = H - 2          # rows between top and bottom border
 
-        # Clear with transparent background (default colours)
         w.bkgdset(' ', curses.color_pair(C_BASE))
         w.erase()
 
         try:
             if focused:
-                # Focused: purple rounded border
                 w.border()
                 w.addch(0, 0,       '╭', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
                 w.addch(0, W - 1,   '╮', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
                 w.addch(H - 1, 0,   '╰', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
                 w.addch(H - 1, W-1, '╯', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
             else:
-                # Unfocused: dim border
                 w.border()
         except curses.error:
             pass
 
-        vis_w = max(1, W - 4)
-        start = max(0, self.cursor_pos - vis_w + 1)
-        vis   = self.input_buf[start : start + vis_w]
+        # Build list of visual lines and find cursor visual position
+        # Each logical line (split on \n) may wrap into multiple visual lines
+        visual_lines: List[str] = []   # text of each visual line
+        cur_vrow = 0                    # visual row of cursor
+        cur_vcol = 0                    # visual col of cursor
 
-        try:
-            if vis:
-                w.addstr(1, 2, vis, curses.color_pair(C_BASE) | curses.A_BOLD)
-            elif not focused:
+        logical_lines = self.input_buf.split('\n')
+        char_idx = 0
+        for li, line in enumerate(logical_lines):
+            # Split logical line into vis_w-wide chunks
+            chunks = [line[i:i+vis_w] for i in range(0, max(1, len(line)), vis_w)] if line else ['']
+            for ci, chunk in enumerate(chunks):
+                vrow = len(visual_lines)
+                # Is cursor on this chunk?
+                chunk_start = char_idx + ci * vis_w
+                chunk_end   = chunk_start + len(chunk)
+                if chunk_start <= self.cursor_pos <= chunk_end:
+                    # cursor pos within this visual row
+                    local = self.cursor_pos - chunk_start
+                    if local <= len(chunk):
+                        cur_vrow = vrow
+                        cur_vcol = local
+                visual_lines.append(chunk)
+            char_idx += len(line) + 1  # +1 for \n
+
+        # Vertical scroll: keep cursor visible
+        if cur_vrow < self.input_vscroll:
+            self.input_vscroll = cur_vrow
+        elif cur_vrow >= self.input_vscroll + text_rows:
+            self.input_vscroll = cur_vrow - text_rows + 1
+
+        # Draw visible lines
+        attr = curses.color_pair(C_BASE) | curses.A_BOLD
+        if visual_lines and focused or any(visual_lines):
+            for row_offset in range(text_rows):
+                vrow = self.input_vscroll + row_offset
+                if vrow < len(visual_lines):
+                    line_text = visual_lines[vrow]
+                    if line_text:
+                        try:
+                            w.addstr(1 + row_offset, 2, line_text, attr)
+                        except curses.error:
+                            pass
+        elif not focused:
+            try:
                 ph = "Type a message…"[:vis_w]
                 w.addstr(1, 2, ph, curses.color_pair(C_TIMESTAMP))
-        except curses.error:
-            pass
+            except curses.error:
+                pass
 
+        # Position terminal cursor
         if focused:
             try:
-                cx = min(2 + (self.cursor_pos - start), W - 2)
+                screen_row = 1 + (cur_vrow - self.input_vscroll)
+                screen_col = 2 + cur_vcol
+                screen_col = min(screen_col, W - 2)
                 wy, wx = w.getbegyx()
-                self._cursor_yx = (wy + 1, wx + cx)
+                self._cursor_yx = (wy + screen_row, wx + screen_col)
             except curses.error:
                 self._cursor_yx = None
         else:
             self._cursor_yx = None
+
+        # Scroll indicator on right border if content is scrolled
+        if self.input_vscroll > 0:
+            try:
+                w.addch(1, W - 1, '▲', curses.color_pair(C_TIMESTAMP))
+            except curses.error:
+                pass
+        if self.input_vscroll + text_rows < len(visual_lines):
+            try:
+                w.addch(H - 2, W - 1, '▼', curses.color_pair(C_TIMESTAMP))
+            except curses.error:
+                pass
 
         w.noutrefresh()
 
@@ -2749,8 +2818,10 @@ class ChatUI:
 
     def consume_input(self) -> str:
         t = self.input_buf
-        self.input_buf  = ""
-        self.cursor_pos = 0
+        self.input_buf      = ""
+        self.cursor_pos     = 0
+        self.input_vscroll  = 0
+        self.input_h        = INPUT_H
         return t
 
     def _user_colour_pair(self, xterm_idx: int) -> int:
@@ -3139,6 +3210,15 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             elif ui.menu_cursor == 2:  # Toggle image preview
                 ui.image_preview_enabled = not ui.image_preview_enabled
                 _save_config({'image_preview': ui.image_preview_enabled})
+                if ui.image_preview_enabled:
+                    # Detect protocol now if it wasn't done at startup
+                    global _IMG_PROTO, _CELL_PX
+                    if _IMG_PROTO is None:
+                        _IMG_PROTO = _detect_protocol()
+                        _dbg.debug('image protocol (on enable): %s', _IMG_PROTO)
+                    if _IMG_PROTO and _CELL_PX is None:
+                        _CELL_PX = _query_cell_pixels()
+                        _dbg.debug('cell pixels (on enable): %s', _CELL_PX)
                 ui.set_status(f'Image Preview {"ON" if ui.image_preview_enabled else "OFF"}', ttl=2.0)
             elif ui.menu_cursor == 3:  # Pick colour
                 if ui.colour_list:
@@ -3479,6 +3559,44 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     break
             await asyncio.sleep(0.02)
             continue
+
+        # Detect Shift+Enter: \x1b followed immediately by \r or \n (Alt+Enter in many
+        # terminals), or the kitty/CSI-u sequence \x1b[13;2u.
+        # We peek at the next character(s) with a very short timeout.
+        if key == '\x1b':
+            # Try to read the next char non-blockingly
+            try:
+                k2 = stdscr.get_wch()
+                if k2 in ('\r', '\n', 10):
+                    # Alt/Shift+Enter — insert newline in input
+                    if ui.focus == Focus.INPUT and ui.scroll_cursor < 0:
+                        ui.insert_char('\n')
+                    continue
+                elif k2 == '[':
+                    # Possibly CSI sequence — read more
+                    try:
+                        rest = ''
+                        while True:
+                            k3 = stdscr.get_wch()
+                            rest += (k3 if isinstance(k3, str) else chr(k3))
+                            if rest[-1].isalpha():
+                                break
+                            if len(rest) > 10:
+                                break
+                        if rest == '13;2u':
+                            # Kitty Shift+Enter
+                            if ui.focus == Focus.INPUT and ui.scroll_cursor < 0:
+                                ui.insert_char('\n')
+                            continue
+                        # Unknown CSI — fall through to Esc handling, discard rest
+                    except curses.error:
+                        pass
+                else:
+                    # Some other Alt+key — re-queue k2 by handling Esc first then key
+                    # For now just handle Esc and discard (rare edge case)
+                    pass
+            except curses.error:
+                pass  # No next char — plain Esc
 
         # Esc: close popup if open (suppressed like H), otherwise toggle menu
         if key == '\x1b':
