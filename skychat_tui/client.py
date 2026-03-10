@@ -2274,13 +2274,17 @@ class ChatUI:
         self, w, msg: dict, mi: int, row: int,
         H: int, W: int, margin: int, usable_w: int,
         own_username: str, lines_out: list,
+        skip_lines: int = 0,
     ) -> int:
-        """Render one message starting at *row*. Returns the next free row."""
+        """Render one message starting at *row*. Returns the next free row.
+        skip_lines: skip this many lines from the top of the message (for partial
+        display when the message is clipped at the top of the viewport)."""
         ts, user, msg_content = msg["ts"], msg["user"], msg["content"]
         is_sel = (self.scroll_cursor == mi)
         sel_a  = curses.color_pair(C_MSG_SELECT)
         qt_a   = curses.color_pair(C_TIMESTAMP)
         prefix = len(ts) + 1 + len(user) + 2
+        _skip  = skip_lines   # mutable counter — decremented as we skip lines
 
         # ── Quoted line ───────────────────────────────────────────────
         qdata = msg.get("quoted")
@@ -2295,15 +2299,18 @@ class ChatUI:
             if len(q_text) > avail:
                 q_text = q_text[:avail - 1] + "…"
             q_line = q_prefix + q_text
-            try:
-                if is_sel:
-                    w.addstr(row, 0, " " * (W - 1), sel_a)
-                w.addstr(row, margin, q_line[:max(0, W - margin - 1)],
-                         sel_a if is_sel else qt_a)
-            except curses.error:
-                pass
             lines_out.append((ts, user, q_line, False))
-            row += 1
+            if _skip > 0:
+                _skip -= 1
+            else:
+                try:
+                    if is_sel:
+                        w.addstr(row, 0, " " * (W - 1), sel_a)
+                    w.addstr(row, margin, q_line[:max(0, W - margin - 1)],
+                             sel_a if is_sel else qt_a)
+                except curses.error:
+                    pass
+                row += 1
 
         # ── Wrapped content lines ─────────────────────────────────────
         _msg_interactables = _get_interactables(msg_content)
@@ -2316,6 +2323,9 @@ class ChatUI:
                 break
             is_first = (wi == 0)
             lines_out.append((ts, user, chunk, is_first))
+            if _skip > 0:
+                _skip -= 1
+                continue
             col = margin
 
             def _draw_segment(txt, base_attr,
@@ -2407,15 +2417,18 @@ class ChatUI:
         reactions = msg.get("reactions", {})
         if reactions and row < H - 1:
             rbar = "".join(f" {e}×{c} " for e, c in list(reactions.items())[:8])
-            try:
-                if is_sel:
-                    w.addstr(row, 0, " " * (W - 1), sel_a)
-                w.addstr(row, margin, rbar[:max(0, W - margin - 1)],
-                         sel_a if is_sel else curses.color_pair(C_SELF) | curses.A_BOLD)
-            except curses.error:
-                pass
             lines_out.append((ts, user, rbar, False))
-            row += 1
+            if _skip > 0:
+                _skip -= 1
+            else:
+                try:
+                    if is_sel:
+                        w.addstr(row, 0, " " * (W - 1), sel_a)
+                    w.addstr(row, margin, rbar[:max(0, W - margin - 1)],
+                             sel_a if is_sel else curses.color_pair(C_SELF) | curses.A_BOLD)
+                except curses.error:
+                    pass
+                row += 1
 
         return row
 
@@ -2478,9 +2491,16 @@ class ChatUI:
         rows_avail  = H - 1
         render_msgs: List[int] = []
         rows_used   = 0
+        skip_top    = 0   # lines to skip from the top of the oldest (topmost) message
         for i in range(newest_idx, -1, -1):
             nlines = self._msg_line_count(self.messages[i], usable_w)
-            if rows_used + nlines > rows_avail and render_msgs:
+            if rows_used + nlines > rows_avail:
+                # This message doesn't fully fit. If we already have messages,
+                # partially show this one — skip its top lines to fill the screen.
+                overflow = (rows_used + nlines) - rows_avail
+                skip_top = overflow
+                render_msgs.append(i)
+                rows_used = rows_avail
                 break
             render_msgs.append(i)
             rows_used += nlines
@@ -2499,9 +2519,11 @@ class ChatUI:
         row          = max(0, H - 1 - rows_used)
         lines_out: List[tuple] = []
         for mi in render_msgs:
+            skip = skip_top if mi == render_msgs[0] else 0
             row = self._draw_message(
                 w, self.messages[mi], mi, row,
                 H, W, margin, usable_w, own_username, lines_out,
+                skip_lines=skip,
             )
         self._last_lines_out = lines_out
 
