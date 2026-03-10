@@ -12,6 +12,7 @@ license         = { text = "MIT" }
 
 dependencies = [
     "websockets>=12.0",
+    "pillow>=12.0",
 ]
 
 [project.scripts]

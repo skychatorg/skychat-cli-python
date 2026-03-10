@@ -45,6 +45,13 @@ except ImportError:
     print("Missing dependency. Install with:  pip install websockets")
     sys.exit(1)
 
+try:
+    from PIL import Image as _PILImage
+    _PILLOW_OK = True
+except ImportError:
+    _PILImage  = None
+    _PILLOW_OK = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -284,6 +291,377 @@ def _parse_msg_ts(msg: dict) -> str:
         except Exception:
             continue
     return datetime.now().strftime('%H:%M')
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kitty graphics protocol
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _query_cell_pixels() -> Tuple[int, int]:
+    """Query terminal for cell size in pixels via CSI 16 t.
+    Returns (cell_w_px, cell_h_px). Falls back to (10, 20) if unsupported."""
+    import select, termios, tty
+    try:
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        os.write(1, b'\033[16t')
+        ready, _, _ = select.select([fd], [], [], 0.5)
+        resp = b''
+        if ready:
+            resp = os.read(fd, 32)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        import re as _re
+        m = _re.search(rb'\033\[6;(\d+);(\d+)t', resp)
+        if m:
+            cw, ch = int(m.group(2)), int(m.group(1))
+            _dbg.debug('_query_cell_pixels: raw=%r -> w=%d h=%d', resp, cw, ch)
+            if 4 <= cw <= 64 and 4 <= ch <= 128:
+                return cw, ch
+    except Exception as e:
+        _dbg.debug('_query_cell_pixels failed: %s', e)
+    return 10, 20
+
+
+_CELL_PX: Optional[Tuple[int, int]] = None  # (w_px, h_px), queried once
+
+_SIXEL_GRAPHICS: Optional[bool] = None  # None = not yet probed
+
+IMAGE_EXTS = frozenset({
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.avif',
+})
+
+def _is_image_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    return any(urlparse(url).path.lower().endswith(e) for e in IMAGE_EXTS)
+
+
+def _detect_sixel_support() -> bool:
+    """Detect sixel graphics support.
+    foot, xterm (with -ti vt340), mlterm, yaft, and others support sixel.
+    foot sets TERM=foot or TERM=foot-extra."""
+    term         = os.environ.get('TERM', '')
+    term_program = os.environ.get('TERM_PROGRAM', '')
+    colorterm    = os.environ.get('COLORTERM', '')
+    # Known sixel-capable terminals
+    if term in ('foot', 'foot-extra'):
+        return True
+    if term_program in ('iTerm.app',):
+        return True
+    if 'mlterm' in term or 'yaft' in term:
+        return True
+    if 'kitty' in term or os.environ.get('KITTY_WINDOW_ID'):
+        return False  # kitty does NOT support sixel
+    # xterm with sixel compiled in
+    if term.startswith('xterm'):
+        return True
+    return False
+
+
+import logging as _logging
+_logging.basicConfig(filename='/tmp/skychat_img_debug.log', level=_logging.DEBUG,
+                     format='%(asctime)s %(message)s')
+_dbg = _logging.getLogger('img')
+
+
+def _encode_sixel(img_rgb: bytes, w: int, h: int) -> bytes:
+    """Encode raw RGB bytes as a sixel stream.
+
+    Sixel basics:
+      • Each sixel column is 6 pixels tall.
+      • We quantize to ≤256 colours with Pillow's quantize().
+      • DCS intro:  ESC P <pa>;<pb>;<pc> q  (we use 0;1;8)
+      • Colour defs: #<i>;2;<r>;<g>;<b>  (r/g/b in 0-100)
+      • Raster attrs: "1;1;<w>;<h>
+      • For each 6-row band: emit colour runs then '-' (newline) or '\n'.
+      • ST terminator: ESC \
+    """
+    if _PILImage is None:
+        raise RuntimeError('Pillow not available')
+    import io as _io
+    img = _PILImage.frombytes('RGB', (w, h), img_rgb)
+    # Quantize to 256 colours
+    img_p = img.quantize(colors=256, method=_PILImage.Quantize.MEDIANCUT, dither=0)
+    palette_raw = img_p.getpalette()          # flat [R,G,B, R,G,B, ...] × 256
+    pixels = list(img_p.tobytes())            # raw palette indices, one byte per pixel
+    ncolors = len(palette_raw) // 3
+
+    buf = bytearray()
+    buf += b'\033P0;1;8q'                     # DCS: aspect 1:1, bg transparent
+    buf += f'"1;1;{w};{h}\n'.encode()         # raster attributes
+
+    # Colour definitions
+    for ci in range(ncolors):
+        r = round(palette_raw[ci*3]     * 100 / 255)
+        g = round(palette_raw[ci*3 + 1] * 100 / 255)
+        b = round(palette_raw[ci*3 + 2] * 100 / 255)
+        buf += f'#{ci};2;{r};{g};{b}'.encode()
+
+    # Sixel bands — each band is 6 pixel rows
+    num_bands = (h + 5) // 6
+    for band in range(num_bands):
+        y0 = band * 6
+        # For each colour used in this band, build a bitfield array across the width
+        used: dict = {}
+        for dy in range(6):
+            y = y0 + dy
+            if y >= h:
+                break
+            bit = 1 << dy
+            row_start = y * w
+            for x in range(w):
+                ci = pixels[row_start + x]
+                if ci not in used:
+                    used[ci] = bytearray(w)
+                used[ci][x] |= bit
+
+        # Emit each colour in this band using RLE
+        first = True
+        for ci, bits in used.items():
+            if not first:
+                buf += b'$'          # carriage return (go back to col 0 same band)
+            first = False
+            buf += f'#{ci}'.encode()
+            # RLE encode the sixel values
+            x = 0
+            while x < w:
+                val = bits[x]
+                run = 1
+                while x + run < w and bits[x + run] == val and run < 255:
+                    run += 1
+                sixel_char = val + 63          # sixel char: 63..126
+                if run >= 3:
+                    buf += f'!{run}'.encode() + bytes([sixel_char])
+                else:
+                    buf += bytes([sixel_char] * run)
+                x += run
+
+        buf += b'-'                  # sixel newline (next band)
+
+    buf += b'\033\\'                 # ST: string terminator
+    return bytes(buf)
+
+
+def _sixel_place(sixel_data: bytes, cell_x: int, cell_y: int) -> None:
+    """Write sixel data at terminal cell (cell_x, cell_y).
+    Uses os.write(1, ...) directly — curses owns fd 1."""
+    _dbg.debug('_sixel_place cell=(%d,%d) bytes=%d', cell_x, cell_y, len(sixel_data))
+    buf = bytearray()
+    buf += b'\0337'                                        # DECSC: save cursor
+    buf += f'\033[{cell_y + 1};{cell_x + 1}H'.encode()    # move to cell
+    buf += sixel_data
+    buf += b'\0338'                                        # DECRC: restore cursor
+    os.write(1, bytes(buf))
+
+
+def _sixel_clear(cell_x: int, cell_y: int, cell_w: int, cell_h: int) -> None:
+    """Erase the region where a sixel image was placed by overwriting with spaces."""
+    buf = bytearray()
+    buf += b'\0337'
+    for row in range(cell_h):
+        buf += f'\033[{cell_y + row + 1};{cell_x + 1}H'.encode()
+        buf += b' ' * cell_w
+    buf += b'\0338'
+    os.write(1, bytes(buf))
+
+
+class SixelImagePopup:
+    """Curses chrome (border/spinner) + sixel pixel layer for image preview.
+
+    Lifecycle:
+        popup = SixelImagePopup(stdscr, url)
+        asyncio.ensure_future(popup.load())
+        # every frame: popup.draw()
+        # popup.handle_key(k) → True means dismiss
+        # popup.close() to clean up
+
+    Sixel images persist in terminal cells — no per-frame resend needed.
+    We re-place only when curses redraws cells (touchwin forces that every frame,
+    so we track _needs_restamp and re-place once after each doupdate).
+    """
+
+    def __init__(self, stdscr, url: str):
+        self.stdscr         = stdscr
+        self.url            = url
+        self._state         = 'loading'
+        self._error         = ''
+        self._placed        = False
+        self._pending_place = False
+        self._dirty         = True
+        self._sixel_data: Optional[bytes] = None
+        self._px_w = self._px_h = 0
+        self._spinner       = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+        self._frame         = 0
+        self._last_spin     = 0.0
+        self._win           = None
+        self._py = self._px = self._ph = self._pw = 0
+        self._img_cy = self._img_cx = self._img_cw = self._img_ch = 0
+        self._layout()
+
+    def _layout(self) -> None:
+        H, W = self.stdscr.getmaxyx()
+        ph   = max(10, min(H - 2, int(H * 0.85)))
+        pw   = max(24, min(W - 2, int(W * 0.90)))
+        py   = (H - ph) // 2
+        px   = (W - pw) // 2
+        self._py, self._px, self._ph, self._pw = py, px, ph, pw
+        self._img_cy = py + 1
+        self._img_cx = px + 1
+        self._img_cw = pw - 2
+        self._img_ch = ph - 2
+        if self._win is not None:
+            del self._win
+        self._win = curses.newwin(ph, pw, py, px)
+        self._win.bkgd(' ', curses.color_pair(C_BORDER))
+        self._dirty = True
+
+    def resize(self) -> None:
+        self._placed = False
+        self._layout()
+        if self._state == 'ready' and self._sixel_data:
+            self._pending_place = True
+
+    async def load(self) -> None:
+        _dbg.debug('load() start url=%s', self.url)
+        loop = asyncio.get_event_loop()
+        cw, ch = self._img_cw, self._img_ch
+        try:
+            _dbg.debug('load() entering executor cw=%d ch=%d', cw, ch)
+            sixel, w, h = await asyncio.wait_for(
+                loop.run_in_executor(None, self._fetch_scale_encode, cw, ch),
+                timeout=20)
+            _dbg.debug('load() done w=%d h=%d sixel_bytes=%d', w, h, len(sixel))
+            self._sixel_data = sixel
+            self._px_w, self._px_h = w, h
+            self._state = 'ready'
+            self._dirty = True
+            self._pending_place = True
+        except asyncio.TimeoutError:
+            _dbg.debug('load() timeout')
+            self._state = 'error'
+            self._error = '✗  Timed out (20 s)'
+            self._dirty = True
+        except Exception as exc:
+            _dbg.debug('load() exception: %s', exc, exc_info=True)
+            self._state = 'error'
+            self._error = f'✗  {str(exc)[:60]}'
+            self._dirty = True
+
+    def _fetch_scale_encode(self, cw: int, ch: int):
+        import urllib.request, urllib.error, io as _io
+        req = urllib.request.Request(
+            self.url, headers={'User-Agent': 'skychat-tui/1.0'})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read(12 * 1024 * 1024)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f'Download failed: {e.reason}')
+        try:
+            img = _PILImage.open(_io.BytesIO(raw))
+            img.load()
+        except Exception as e:
+            raise RuntimeError(f'Cannot decode: {e}')
+        if hasattr(img, 'n_frames') and img.n_frames > 1:
+            img.seek(0)
+        img = img.convert('RGB')
+        cell_w_px, cell_h_px = (_CELL_PX if _CELL_PX else (10, 20))
+        inner_cw = max(1, cw - 2)
+        inner_ch = max(1, ch - 2)
+        tw = min(inner_cw * cell_w_px, 800)
+        th = min(inner_ch * cell_h_px, 600)
+        iw, ih = img.size
+        scale = min(tw / max(iw, 1), th / max(ih, 1), 1.0)
+        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        img = img.resize((nw, nh), _PILImage.LANCZOS)
+        _dbg.debug('scaled %dx%d -> %dx%d', iw, ih, nw, nh)
+        sixel = _encode_sixel(img.tobytes(), nw, nh)
+        return sixel, nw, nh
+
+    def _place(self) -> None:
+        """Write the sixel stream at the image position inside the popup."""
+        _dbg.debug('_place() called state=%s has_data=%s', self._state, bool(self._sixel_data))
+        if self._sixel_data:
+            cell_w_px, cell_h_px = (_CELL_PX if _CELL_PX else (10, 20))
+            img_cols = max(1, round(self._px_w / cell_w_px))
+            img_rows = max(1, round(self._px_h / cell_h_px))
+            cx = self._img_cx + max(0, (self._img_cw - img_cols) // 2)
+            cy = self._img_cy + max(0, (self._img_ch - img_rows) // 2)
+            _sixel_place(self._sixel_data, cx, cy)
+            self._placed = True
+            _dbg.debug('_place() done at cell=(%d,%d)', cx, cy)
+
+    def draw(self) -> None:
+        w  = self._win
+        ph, pw = self._ph, self._pw
+        bp = curses.color_pair(C_BORDER)
+        ab = bp | curses.A_BOLD
+
+        if self._dirty:
+            w.erase()
+            try:
+                for r in range(ph):
+                    w.addstr(r, 0, ' ' * (pw - 1), bp)
+                for r in range(1, ph - 1):
+                    w.addch(r, 0,      '│', ab)
+                    w.addch(r, pw - 1, '│', ab)
+                for c in range(1, pw - 1):
+                    w.addch(0,      c, '─', ab)
+                    w.addch(ph - 1, c, '─', ab)
+                w.addch(0,      0,      '╭', ab)
+                w.addch(0,      pw - 1, '╮', ab)
+                w.addch(ph - 1, 0,      '╰', ab)
+                try:
+                    w.addch(ph - 1, pw - 1, '╯', ab)
+                except curses.error:
+                    pass
+            except curses.error:
+                pass
+            hint = ' scroll to close '
+            try:
+                w.addstr(0, max(2, (pw - len(hint)) // 2), hint, ab)
+            except curses.error:
+                pass
+            if self._state == 'error':
+                for i, line in enumerate([self._error, '', 'scroll away to close']):
+                    attr = curses.color_pair(C_ERROR) | curses.A_BOLD if i == 0 else bp
+                    try:
+                        w.addstr(ph // 2 - 1 + i,
+                                 max(0, (pw - len(line)) // 2),
+                                 line[:pw - 2], attr)
+                    except curses.error:
+                        pass
+            elif self._state == 'ready':
+                try:
+                    w.addstr(ph - 1, 2, self.url[:pw - 4], bp)
+                except curses.error:
+                    pass
+            self._dirty = False
+
+        if self._state == 'loading':
+            now = time.monotonic()
+            if now - self._last_spin > 0.12:
+                self._frame     = (self._frame + 1) % len(self._spinner)
+                self._last_spin = now
+            msg = f' {self._spinner[self._frame]}  Loading… '
+            try:
+                w.addstr(ph // 2, max(0, (pw - len(msg)) // 2), msg, bp)
+            except curses.error:
+                pass
+
+        w.touchwin()
+        w.noutrefresh()
+
+    def handle_key(self, key) -> bool:
+        return key in ('\x1b', 'q', 'Q', curses.KEY_BACKSPACE, 127)
+
+    def close(self) -> None:
+        self._placed = False
+        if self._win is not None:
+            self._win.erase()
+            self._win.noutrefresh()
+            del self._win
+            self._win = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1070,6 +1448,7 @@ class ChatUI:
         self.scroll_cursor: int   = -1
         self.btn_cursor:    int   = 0   # focused interactable index in selected message
         self.typing_list:   List[str] = []
+        self._overlay: Optional['SixelImagePopup'] = None  # image popup painted before doupdate
 
         self._colour_pair_cache:  Dict[int, int] = {}
         self._next_pair:          int            = C_DYN_BASE
@@ -1278,9 +1657,23 @@ class ChatUI:
                 curses.setsyx(*self._cursor_yx)
             else:
                 curses.curs_set(0)
+            # Paint image popup chrome on top of everything, just before flush
+            if self._overlay is not None:
+                _dbg.debug('draw_all: calling overlay.draw() state=%s dirty=%s', self._overlay._state, self._overlay._dirty)
+                self._overlay.draw()
             curses.doupdate()
-        except curses.error:
-            pass
+            # Re-stamp sixel image every frame after doupdate().
+            # touchwin() in draw() forces curses to repaint all popup cells each frame,
+            # which erases the sixel pixels. So we re-place after every doupdate.
+            if self._overlay is not None and self._overlay._state == 'ready':
+                if self._overlay._pending_place:
+                    _dbg.debug('draw_all: calling _place() (pending)')
+                    self._overlay._pending_place = False
+                self._overlay._place()
+            elif self._overlay is not None:
+                _dbg.debug('draw_all: overlay state=%s, skipping place', self._overlay._state)
+        except Exception as _e:
+            _dbg.debug('draw_all: EXCEPTION %s: %s', type(_e).__name__, _e, exc_info=True)
 
     # ── Header ────────────────────────────────────────────────────────
 
@@ -2484,6 +2877,20 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
     # ── Main loop ─────────────────────────────────────────────────────
 
+    global _SIXEL_GRAPHICS, _CELL_PX
+    if _SIXEL_GRAPHICS is None:
+        _SIXEL_GRAPHICS = _PILLOW_OK and _detect_sixel_support()
+    if _SIXEL_GRAPHICS and _CELL_PX is None:
+        _CELL_PX = _query_cell_pixels()
+        _dbg.debug('cell pixels: %s', _CELL_PX)
+
+    image_popup:      Optional[SixelImagePopup] = None
+    _hover_url:       str                       = ""   # currently open popup URL
+    _hover_cand:      str                       = ""   # current candidate (may differ from open)
+    _hover_since:     float                     = 0.0  # when candidate last changed
+    _HOVER_OPEN_MS  = 0.25   # seconds stable before opening
+    _HOVER_CLOSE_MS = 0.40   # seconds empty before closing (tolerates transient resets)
+
     while True:
         rooms_list = client.rooms
         users_list = client._connected_list
@@ -2502,6 +2909,50 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             own_user        = client.current_user,
             unread_checker  = client.has_unread_messages,
         )
+
+        # ── Hover image preview ───────────────────────────────────────
+        if _SIXEL_GRAPHICS:
+            _new_hover = ""
+            if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
+                _ias = _get_interactables(ui.messages[ui.scroll_cursor].get("content", ""))
+                if _ias:
+                    _focused_val, _focused_kind = _ias[ui.btn_cursor % len(_ias)]
+                    if _focused_kind == "url" and _is_image_url(_focused_val):
+                        _new_hover = _focused_val
+
+            _now = time.monotonic()
+            if _new_hover != _hover_cand:
+                _hover_cand  = _new_hover
+                _hover_since = _now
+
+            _elapsed = _now - _hover_since
+
+            if image_popup is None:
+                # Not open — open once candidate has been stable long enough
+                if _hover_cand and _elapsed >= _HOVER_OPEN_MS:
+                    _hover_url = _hover_cand
+                    image_popup = SixelImagePopup(stdscr, _hover_url)
+                    ui._overlay = image_popup
+                    asyncio.ensure_future(image_popup.load())
+                    _dbg.debug('popup opened: %r', _hover_url)
+            else:
+                # Open — only close if candidate has been empty long enough,
+                # OR if candidate is a *different* URL that has stabilised
+                if not _hover_cand and _elapsed >= _HOVER_CLOSE_MS:
+                    _dbg.debug('popup closed (timeout empty)')
+                    image_popup.close()
+                    image_popup = None
+                    ui._overlay = None
+                    _hover_url  = ""
+                elif _hover_cand and _hover_cand != _hover_url and _elapsed >= _HOVER_OPEN_MS:
+                    _dbg.debug('popup switched: %r -> %r', _hover_url, _hover_cand)
+                    image_popup.close()
+                    image_popup = None
+                    ui._overlay = None
+                    _hover_url  = _hover_cand
+                    image_popup = SixelImagePopup(stdscr, _hover_url)
+                    ui._overlay = image_popup
+                    asyncio.ensure_future(image_popup.load())
 
         # Scroll-read ack: find the highest message-id currently on screen
         # and notify the server once the viewport has been stable for 1s.
@@ -2525,6 +2976,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         if key == curses.KEY_RESIZE:
             ui.resize()
+            if image_popup is not None:
+                image_popup.resize()
             # Drain any further resize events that queued up during the resize
             # so we don't spin through them all without ever yielding.
             while True:
