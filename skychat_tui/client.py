@@ -52,6 +52,16 @@ except ImportError:
     _PILImage  = None
     _PILLOW_OK = False
 
+try:
+    import caca as _caca
+    from caca.canvas  import Canvas  as _CacaCanvas
+    from caca.dither  import Dither  as _CacaDither
+    from caca.display import Display as _CacaDisplay
+    _CACA_OK = True
+except ImportError:
+    _caca = _CacaCanvas = _CacaDither = _CacaDisplay = None
+    _CACA_OK = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -387,43 +397,50 @@ def _is_image_url(url: str) -> bool:
 
 def _detect_protocol() -> Optional[str]:
     """Detect the best available image protocol.
-    Order of preference: sixel > kitty (sixel is battle-tested here).
+    Order of preference: sixel > kitty > caca.
+    Sixel/kitty require Pillow. Caca is a pure ASCII-art fallback.
     Uses env vars first; falls back to terminal probing for ambiguous cases.
-    Returns 'sixel', 'kitty', or None."""
-    if not _PILLOW_OK:
-        _dbg.debug('_detect_protocol: Pillow not available')
-        return None
-
+    Returns 'sixel', 'kitty', 'caca', or None."""
     term         = os.environ.get('TERM', '')
     term_program = os.environ.get('TERM_PROGRAM', '')
     kitty_id     = os.environ.get('KITTY_WINDOW_ID', '')
 
-    # --- Kitty: definitive env var ---
-    if kitty_id or 'kitty' in term:
-        _dbg.debug('_detect_protocol: kitty via env')
-        return 'kitty'
+    if _PILLOW_OK:
+        # --- Kitty: definitive env var ---
+        if kitty_id or 'kitty' in term:
+            _dbg.debug('_detect_protocol: kitty via env')
+            return 'kitty'
 
-    # --- Sixel: known terminals ---
-    if term in ('foot', 'foot-extra'):
-        _dbg.debug('_detect_protocol: sixel via env (foot)')
-        return 'sixel'
-    if 'mlterm' in term or 'yaft' in term:
-        _dbg.debug('_detect_protocol: sixel via env (mlterm/yaft)')
-        return 'sixel'
-    if term_program == 'iTerm.app':
-        _dbg.debug('_detect_protocol: sixel via env (iTerm2)')
-        return 'sixel'
+        # --- Sixel: known terminals ---
+        if term in ('foot', 'foot-extra'):
+            _dbg.debug('_detect_protocol: sixel via env (foot)')
+            return 'sixel'
+        if 'mlterm' in term or 'yaft' in term:
+            _dbg.debug('_detect_protocol: sixel via env (mlterm/yaft)')
+            return 'sixel'
+        if term_program == 'iTerm.app':
+            _dbg.debug('_detect_protocol: sixel via env (iTerm2)')
+            return 'sixel'
 
-    # --- Ambiguous / unknown: probe the terminal ---
-    _dbg.debug('_detect_protocol: probing terminal (TERM=%r)', term)
-    if _probe_sixel():
-        _dbg.debug('_detect_protocol: sixel confirmed by probe')
-        return 'sixel'
-    if _probe_kitty():
-        _dbg.debug('_detect_protocol: kitty confirmed by probe')
-        return 'kitty'
+        # --- Ambiguous / unknown: probe the terminal ---
+        _dbg.debug('_detect_protocol: probing terminal (TERM=%r)', term)
+        if _probe_sixel():
+            _dbg.debug('_detect_protocol: sixel confirmed by probe')
+            return 'sixel'
+        if _probe_kitty():
+            _dbg.debug('_detect_protocol: kitty confirmed by probe')
+            return 'kitty'
 
-    _dbg.debug('_detect_protocol: no image protocol detected')
+    # --- Caca fallback: works in any colour terminal, no pixel protocol needed ---
+    import shutil as _shutil
+    _img2txt_available = bool(_shutil.which('img2txt'))
+    if _CACA_OK or _img2txt_available:
+        _dbg.debug('_detect_protocol: caca fallback (bindings=%s img2txt=%s)',
+                   _CACA_OK, _img2txt_available)
+        return 'caca'
+
+    _dbg.debug('_detect_protocol: no image protocol detected (Pillow=%s caca=%s)',
+               _PILLOW_OK, _CACA_OK)
     return None
 
 
@@ -513,6 +530,230 @@ def _sixel_clear(cell_x: int, cell_y: int, cell_w: int, cell_h: int) -> None:
     os.write(1, bytes(buf))
 
 
+# ── Caca ───────────────────────────────────────────────────────────────────
+
+# ── Caca colour pairs ──────────────────────────────────────────────────────
+# We have the gap 21-31 (11 slots) between C_MSG_SELECT=20 and C_DYN_BASE=32.
+# Pre-bake a fixed palette there: 8 "colour-on-black" pairs + 3 extras.
+# All caca ANSI colours are snapped to one of these at render time — no
+# dynamic init_pair calls, so nothing in the main UI can ever be clobbered.
+#
+#  Pair  fg                  bg
+#  21    COLOR_WHITE         COLOR_BLACK   (default / reset)
+#  22    COLOR_RED           COLOR_BLACK
+#  23    COLOR_GREEN         COLOR_BLACK
+#  24    COLOR_YELLOW        COLOR_BLACK
+#  25    COLOR_BLUE          COLOR_BLACK
+#  26    COLOR_MAGENTA       COLOR_BLACK
+#  27    COLOR_CYAN          COLOR_BLACK
+#  28    COLOR_BLACK         COLOR_BLACK   (solid black)
+#  29    COLOR_WHITE         COLOR_RED     (bright highlight)
+#  30    COLOR_BLACK         COLOR_WHITE   (inverse)
+#  31    COLOR_WHITE         COLOR_BLUE    (blue bg)
+
+_CACA_PAIR_BASE = 21   # first pair in our reserved block
+_CACA_PAIR_END  = 31   # last  pair in our reserved block (inclusive)
+
+# (fg_curses, bg_curses) -> pair number — filled by _init_caca_pairs()
+_CACA_PAIR_MAP: dict = {}
+
+def _init_caca_pairs() -> None:
+    """Register the 11 fixed caca pairs.  Call once after curses.start_color()."""
+    _pairs = [
+        (curses.COLOR_WHITE,   curses.COLOR_BLACK),   # 21 default
+        (curses.COLOR_RED,     curses.COLOR_BLACK),   # 22
+        (curses.COLOR_GREEN,   curses.COLOR_BLACK),   # 23
+        (curses.COLOR_YELLOW,  curses.COLOR_BLACK),   # 24
+        (curses.COLOR_BLUE,    curses.COLOR_BLACK),   # 25
+        (curses.COLOR_MAGENTA, curses.COLOR_BLACK),   # 26
+        (curses.COLOR_CYAN,    curses.COLOR_BLACK),   # 27
+        (curses.COLOR_BLACK,   curses.COLOR_BLACK),   # 28 solid black
+        (curses.COLOR_WHITE,   curses.COLOR_RED),     # 29 highlight
+        (curses.COLOR_BLACK,   curses.COLOR_WHITE),   # 30 inverse
+        (curses.COLOR_WHITE,   curses.COLOR_BLUE),    # 31 blue bg
+    ]
+    for i, (fg, bg) in enumerate(_pairs):
+        pair_n = _CACA_PAIR_BASE + i
+        try:
+            curses.init_pair(pair_n, fg, bg)
+            _CACA_PAIR_MAP[(fg, bg)] = pair_n
+        except Exception:
+            pass
+
+# ANSI 256-colour index → nearest curses colour constant
+def _ansi256_to_curses(n: int) -> int:
+    if n < 8:
+        return [curses.COLOR_BLACK, curses.COLOR_RED, curses.COLOR_GREEN,
+                curses.COLOR_YELLOW, curses.COLOR_BLUE, curses.COLOR_MAGENTA,
+                curses.COLOR_CYAN, curses.COLOR_WHITE][n]
+    if n < 16:   # bright variants — map to same base colour
+        return _ansi256_to_curses(n - 8)
+    if n >= 232: # greyscale ramp 232-255
+        return curses.COLOR_WHITE if (n - 232) > 11 else curses.COLOR_BLACK
+    # 6×6×6 colour cube 16-231
+    n -= 16
+    b, tmp = n % 6, n // 6
+    g, r   = tmp % 6, tmp // 6
+    mx = max(r, g, b)
+    if mx == 0:              return curses.COLOR_BLACK
+    if r >= 4 and g < 3 and b < 3: return curses.COLOR_RED
+    if g >= 4 and r < 3 and b < 3: return curses.COLOR_GREEN
+    if b >= 4 and r < 3 and g < 3: return curses.COLOR_BLUE
+    if r >= 3 and g >= 3 and b < 2: return curses.COLOR_YELLOW
+    if r >= 3 and b >= 3 and g < 2: return curses.COLOR_MAGENTA
+    if g >= 3 and b >= 3 and r < 2: return curses.COLOR_CYAN
+    return curses.COLOR_WHITE
+
+def _snap_caca_pair(fg: int, bg: int) -> int:
+    """Return the curses color_pair int for the nearest pre-baked caca pair."""
+    # Exact hit first
+    if (fg, bg) in _CACA_PAIR_MAP:
+        return curses.color_pair(_CACA_PAIR_MAP[(fg, bg)])
+    # Snap bg: if bg is not black, try to find a pair with that bg;
+    # otherwise fall back to fg-on-black.
+    if bg != curses.COLOR_BLACK:
+        candidate = (fg, bg)
+        # Try swapping to a known bg
+        for known_bg in (curses.COLOR_RED, curses.COLOR_WHITE, curses.COLOR_BLUE):
+            if bg == known_bg and (fg, known_bg) in _CACA_PAIR_MAP:
+                return curses.color_pair(_CACA_PAIR_MAP[(fg, known_bg)])
+        # bg not in our set — drop to black bg
+        bg = curses.COLOR_BLACK
+    # fg on black
+    if (fg, curses.COLOR_BLACK) in _CACA_PAIR_MAP:
+        return curses.color_pair(_CACA_PAIR_MAP[(fg, curses.COLOR_BLACK)])
+    return curses.color_pair(_CACA_PAIR_BASE)   # ultimate fallback: white on black
+
+
+def _parse_ansi_to_spans(raw: bytes, cols: int, rows: int
+                         ) -> 'List[List[Tuple[str,int]]]':
+    """Parse ANSI-coloured img2txt/caca output into curses-renderable spans.
+
+    Returns a list of `rows` lines; each line is a list of (text, curses_attr).
+    Handles both basic (30-37/40-47) and 256-colour (38;5;N / 48;5;N) SGR codes.
+    Colours are approximated to the 11 pre-baked caca pairs (21-31).
+    """
+    import re as _re
+    tok_re  = _re.compile(rb'\033\[([0-9;]*)m|([^\033\n]+)|\n')
+    ansi8   = [curses.COLOR_BLACK, curses.COLOR_RED,     curses.COLOR_GREEN,
+               curses.COLOR_YELLOW, curses.COLOR_BLUE,   curses.COLOR_MAGENTA,
+               curses.COLOR_CYAN,   curses.COLOR_WHITE]
+
+    result: 'List[List[Tuple[str,int]]]' = []
+    cur_line: 'List[Tuple[str,int]]'     = []
+    cur_col  = 0
+    fg       = curses.COLOR_WHITE
+    bg       = curses.COLOR_BLACK
+    bold     = False
+
+    def flush_line():
+        nonlocal cur_line, cur_col
+        # Pad to full width so the popup interior stays clean
+        if cur_col < cols:
+            attr = _snap_caca_pair(curses.COLOR_WHITE, curses.COLOR_BLACK)
+            cur_line.append((' ' * (cols - cur_col), attr))
+        result.append(cur_line)
+        cur_line = []
+        cur_col  = 0
+
+    for m in tok_re.finditer(raw):
+        if m.group(0) == b'\n':
+            flush_line()
+            if len(result) >= rows:
+                break
+            continue
+
+        if m.group(1) is not None:          # SGR escape
+            params_raw = m.group(1)
+            params = [int(x) for x in params_raw.split(b';') if x] if params_raw else [0]
+            i = 0
+            while i < len(params):
+                p = params[i]
+                if p == 0:
+                    fg, bg, bold = curses.COLOR_WHITE, curses.COLOR_BLACK, False
+                elif p == 1:
+                    bold = True
+                elif p == 22:
+                    bold = False
+                elif 30 <= p <= 37:
+                    fg = ansi8[p - 30]
+                elif p == 39:
+                    fg = curses.COLOR_WHITE
+                elif 40 <= p <= 47:
+                    bg = ansi8[p - 40]
+                elif p == 49:
+                    bg = curses.COLOR_BLACK
+                elif 90 <= p <= 97:          # bright fg → same colour
+                    fg = ansi8[p - 90]
+                elif 100 <= p <= 107:        # bright bg → same colour
+                    bg = ansi8[p - 100]
+                elif p == 38 and i + 2 < len(params) and params[i+1] == 5:
+                    fg = _ansi256_to_curses(params[i+2]); i += 2
+                elif p == 48 and i + 2 < len(params) and params[i+1] == 5:
+                    bg = _ansi256_to_curses(params[i+2]); i += 2
+                i += 1
+
+        else:                               # plain text
+            text = m.group(2).decode('utf-8', errors='replace')
+            avail = cols - cur_col
+            if avail <= 0 or not text:
+                continue
+            text  = text[:avail]
+            attr  = _snap_caca_pair(fg, bg)
+            if bold:
+                attr |= curses.A_BOLD
+            cur_line.append((text, attr))
+            cur_col += len(text)
+
+    # Flush any trailing line without a final newline
+    if cur_line or len(result) < rows:
+        flush_line()
+
+    # Pad missing rows
+    blank_attr = _snap_caca_pair(curses.COLOR_WHITE, curses.COLOR_BLACK)
+    while len(result) < rows:
+        result.append([(' ' * cols, blank_attr)])
+
+    return result[:rows]
+
+
+def _render_caca(img_path: str, cols: int, rows: int) -> 'List[List[Tuple[str,int]]]':
+    """Render image to coloured curses spans via img2txt or caca bindings.
+    Returns List[rows] of List[(text, curses_attr)] spans."""
+    import subprocess, shutil
+
+    img2txt = shutil.which('img2txt')
+    if img2txt:
+        try:
+            result = subprocess.run(
+                [img2txt, '--width', str(cols), '--height', str(rows),
+                 '--format', 'utf8', img_path],
+                capture_output=True, timeout=10)
+            if result.returncode == 0:
+                parsed = _parse_ansi_to_spans(result.stdout, cols, rows)
+                _dbg.debug('_render_caca img2txt ok: %d lines', len(parsed))
+                return parsed
+        except Exception as e:
+            _dbg.debug('_render_caca img2txt failed: %s', e)
+
+    if _CACA_OK and _PILImage:
+        try:
+            img    = _PILImage.open(img_path).convert('RGB')
+            iw, ih = img.size
+            pixels = img.tobytes()
+            cv     = _CacaCanvas(cols, rows)
+            dither = _CacaDither(24, iw, ih, iw * 3, 0xff0000, 0x00ff00, 0x0000ff, 0)
+            dither.bitmap(cv, 0, 0, cols, rows, pixels)
+            export = cv.export_to_memory('utf8')
+            parsed = _parse_ansi_to_spans(export, cols, rows)
+            _dbg.debug('_render_caca bindings ok: %d lines', len(parsed))
+            return parsed
+        except Exception as e:
+            _dbg.debug('_render_caca bindings failed: %s', e)
+
+    raise RuntimeError('libcaca not available (install img2txt or python-caca)')
+
+
 # ── Kitty ──────────────────────────────────────────────────────────────────
 
 def _kitty_place(img_rgb: bytes, px_w: int, px_h: int,
@@ -539,6 +780,9 @@ def _kitty_clear(img_id: int) -> None:
     os.write(1, b'\0337\033_Ga=d,d=a\033\\\0338')
 
 
+# ── Caca ───────────────────────────────────────────────────────────────────
+
+
 class ImagePopup:
     """Curses chrome (border/spinner) + pixel image layer for image preview.
     Supports sixel and kitty protocols transparently — protocol is chosen
@@ -561,7 +805,7 @@ class ImagePopup:
         self._placed        = False
         self._pending_place = False
         self._dirty         = True
-        self._img_data: Optional[bytes] = None    # encoded sixel OR raw RGB
+        self._img_data: Optional[bytes] = None    # sixel bytes | raw RGB | caca cells (list)
         self._px_w = self._px_h = 0
         self._spinner       = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
         self._frame         = 0
@@ -602,11 +846,12 @@ class ImagePopup:
             data, w, h = await asyncio.wait_for(
                 loop.run_in_executor(None, self._fetch_scale_encode, cw, ch),
                 timeout=20)
-            _dbg.debug('load() done proto=%s w=%d h=%d bytes=%d', self._proto, w, h, len(data))
-            self._img_data  = data
+            size_desc = f'{len(data)} lines' if isinstance(data, list) else f'{len(data)} bytes'
+            _dbg.debug('load() done proto=%s w=%d h=%d %s', self._proto, w, h, size_desc)
+            self._img_data      = data
             self._px_w, self._px_h = w, h
-            self._state     = 'ready'
-            self._dirty     = True
+            self._state         = 'ready'
+            self._dirty         = True
             self._pending_place = True
         except asyncio.TimeoutError:
             self._state = 'error'
@@ -619,7 +864,7 @@ class ImagePopup:
             self._dirty = True
 
     def _fetch_scale_encode(self, cw: int, ch: int):
-        import urllib.request, urllib.error, io as _io
+        import urllib.request, urllib.error, io as _io, tempfile, os as _os
         req = urllib.request.Request(
             self.url, headers={'User-Agent': 'skychat-tui/1.0'})
         try:
@@ -627,6 +872,33 @@ class ImagePopup:
                 raw = r.read(12 * 1024 * 1024)
         except urllib.error.URLError as e:
             raise RuntimeError(f'Download failed: {e.reason}')
+
+        # ── caca: render to ASCII art lines, no pixel protocol needed ──
+        if self._proto == 'caca':
+            inner_cw = max(1, cw - 2)
+            inner_ch = max(1, ch - 2)
+            # Write raw bytes to a temp file so img2txt / caca can read it
+            suffix = '.png'
+            try:
+                from urllib.parse import urlparse as _up
+                suffix = _os.path.splitext(_up(self.url).path)[1] or '.png'
+            except Exception:
+                pass
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+                tf.write(raw)
+                tmp_path = tf.name
+            try:
+                lines = _render_caca(tmp_path, inner_cw, inner_ch)
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
+            _dbg.debug('caca rendered %d lines x %d cols', len(lines), inner_cw)
+            # Return lines as the data; w/h expressed in cells not pixels
+            return lines, inner_cw, inner_ch
+
+        # ── pixel protocols: decode + scale with Pillow ─────────────
         try:
             img = _PILImage.open(_io.BytesIO(raw))
             img.load()
@@ -646,7 +918,7 @@ class ImagePopup:
         img = img.resize((nw, nh), _PILImage.LANCZOS)
         _dbg.debug('scaled %dx%d -> %dx%d proto=%s', iw, ih, nw, nh, self._proto)
         if self._proto == 'kitty':
-            return img.tobytes(), nw, nh          # raw RGB; kitty encodes inline
+            return img.tobytes(), nw, nh
         else:
             return _encode_sixel(img.tobytes(), nw, nh), nw, nh
 
@@ -660,28 +932,59 @@ class ImagePopup:
         return cx, cy
 
     def _place(self) -> None:
-        """Write the image at the popup interior, blanking the area first."""
+        """Render the image into the popup interior."""
         _dbg.debug('_place() proto=%s has_data=%s', self._proto, bool(self._img_data))
         if not self._img_data:
             return
+
+        if self._proto == 'caca':
+            # ASCII art — draw each (text, attr) span into the curses popup window
+            w = self._win
+            lines: 'List[List[Tuple[str,int]]]' = self._img_data
+            for row, spans in enumerate(lines):
+                if row >= self._img_ch:
+                    break
+                col = 1
+                for text, attr in spans:
+                    avail = (1 + self._img_cw) - col
+                    if avail <= 0:
+                        break
+                    chunk = text[:avail]
+                    if chunk:
+                        try:
+                            w.addstr(row + 1, col, chunk, attr)
+                        except curses.error:
+                            pass
+                        col += len(chunk)
+            w.noutrefresh()
+            self._placed = True
+            _dbg.debug('_place() caca done, %d lines', len(lines))
+            return
+
+        # Pixel protocols (sixel / kitty)
         cx, cy = self._cell_pos()
-        # Always blank the interior first to prevent character bleed-through
+        # Blank interior first to prevent character bleed-through
         _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
         if self._proto == 'kitty':
             _kitty_place(self._img_data, self._px_w, self._px_h, cx, cy)
         else:
             _sixel_place(self._img_data, cx, cy)
         self._placed = True
-        _dbg.debug('_place() done at cell=(%d,%d)', cx, cy)
+        _dbg.debug('_place() pixel done at cell=(%d,%d)', cx, cy)
 
     def erase_image(self) -> None:
-        """Remove the image from screen by overwriting with spaces."""
-        if self._placed:
+        """Remove the image from screen."""
+        if not self._placed:
+            return
+        if self._proto == 'caca':
+            # ASCII art lives in curses cells — just erase the window
+            # and let force_full_redraw handle the rest
+            pass
+        else:
             if self._proto == 'kitty':
                 _kitty_clear(0)
-            # Always do a space-fill — works for both protocols and catches artifacts
             _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
-            _dbg.debug('erase_image done')
+        _dbg.debug('erase_image done proto=%s', self._proto)
 
     def draw(self) -> None:
         w  = self._win
@@ -709,7 +1012,7 @@ class ImagePopup:
                     pass
             except curses.error:
                 pass
-            hint = ' Scroll/H = close · O = open in browser · ◀▶ = cycle '
+            hint = ' Scroll/H = close · O = open in browser · <>  = cycle '
             try:
                 w.addstr(0, max(2, (pw - len(hint)) // 2), hint, ab)
             except curses.error:
@@ -1284,6 +1587,7 @@ def _setup_colors() -> None:
     curses.start_color()
     saved = _load_config().get("theme", "Dracula")
     _apply_theme(saved if saved in THEMES else "Dracula")
+    _init_caca_pairs()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1558,6 +1862,7 @@ class ChatUI:
         self.menu_open:             bool       = False
         self.menu_cursor:           int        = 0
         self.notifications_enabled: bool       = _load_config().get('notifications', True)
+        self.image_preview_enabled: bool       = _load_config().get('image_preview', True)
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -1667,6 +1972,7 @@ class ChatUI:
         items = [
             f"Theme: {_active_theme}",
             f"Notifications: {'ON' if self.notifications_enabled else 'OFF'}",
+            f"Image Preview: {'ON' if self.image_preview_enabled else 'OFF'}",
             "Pick username colour…" if self.colour_list else "Pick colour (not loaded)",
             "Logout",
             "Quit",
@@ -1759,18 +2065,19 @@ class ChatUI:
             self._draw_chat(own_username)
             self._draw_users(connected_list, current_room_id, own_user=self._own_user)
             self._draw_input()
-            if self.menu_open:
-                self._draw_menu(own_username)
             self.stdscr.noutrefresh()
             if self._cursor_yx and not self.menu_open:
                 curses.curs_set(1)
                 curses.setsyx(*self._cursor_yx)
             else:
                 curses.curs_set(0)
-            # Paint image popup chrome on top of everything, just before flush
+            # Paint image popup chrome, then menu on top (menu wins if both open)
             if self._overlay is not None:
                 _dbg.debug('draw_all: calling overlay.draw() state=%s dirty=%s', self._overlay._state, self._overlay._dirty)
                 self._overlay.draw()
+            if self.menu_open:
+                self._draw_menu(own_username)
+                self.stdscr.noutrefresh()
             curses.doupdate()
             # Re-stamp sixel image every frame after doupdate().
             # touchwin() in draw() forces curses to repaint all popup cells each frame,
@@ -2122,7 +2429,7 @@ class ChatUI:
                 sel_msg     = (self.messages[self.scroll_cursor]
                                if 0 <= self.scroll_cursor < len(self.messages) else None)
                 sel_content = sel_msg.get("content", "") if sel_msg else ""
-                link_hint   = "  o=open  ◀▶=cycle" if _get_interactables(sel_content) else ""
+                link_hint   = "  o=open  <>=cycle" if _get_interactables(sel_content) else ""
                 is_own      = sel_msg and sel_msg.get("user") == own_username
                 del_hint    = "  ⌫=delete" if is_own else ""
                 sel_hint    = f"  Spc=quote  e=edit{del_hint}{link_hint}"
@@ -2760,7 +3067,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return False
 
         # Main menu
-        menu_items_count = 5
+        menu_items_count = 6
         if key == curses.KEY_UP:
             ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
         elif key == curses.KEY_DOWN:
@@ -2774,19 +3081,23 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.notifications_enabled = not ui.notifications_enabled
                 _save_config({'notifications': ui.notifications_enabled})
                 ui.set_status(f'Notifications {"ON" if ui.notifications_enabled else "OFF"}', ttl=2.0)
-            elif ui.menu_cursor == 2:  # Pick colour
+            elif ui.menu_cursor == 2:  # Toggle image preview
+                ui.image_preview_enabled = not ui.image_preview_enabled
+                _save_config({'image_preview': ui.image_preview_enabled})
+                ui.set_status(f'Image Preview {"ON" if ui.image_preview_enabled else "OFF"}', ttl=2.0)
+            elif ui.menu_cursor == 3:  # Pick colour
                 if ui.colour_list:
                     ui.colour_pick_open   = True
                     ui.colour_pick_cursor = 0
                 else:
                     ui.set_status('✗  Colour list not yet received', ttl=3.0)
-            elif ui.menu_cursor == 3:  # Logout
+            elif ui.menu_cursor == 4:  # Logout
                 ui.menu_open = False
                 _save_config({'token': None, 'username': ''})
                 client._running = False
                 conn_task.cancel()
                 return True
-            elif ui.menu_cursor == 4:  # Quit
+            elif ui.menu_cursor == 5:  # Quit
                 ui.menu_open = False
                 client._running = False
                 conn_task.cancel()
@@ -2988,12 +3299,13 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     # ── Main loop ─────────────────────────────────────────────────────
 
     global _IMG_PROTO, _CELL_PX
-    if _IMG_PROTO is None:
-        _IMG_PROTO = _detect_protocol()   # 'sixel', 'kitty', or None
-        _dbg.debug('image protocol: %s', _IMG_PROTO)
-    if _IMG_PROTO and _CELL_PX is None:
-        _CELL_PX = _query_cell_pixels()
-        _dbg.debug('cell pixels: %s', _CELL_PX)
+    if ui.image_preview_enabled:
+        if _IMG_PROTO is None:
+            _IMG_PROTO = _detect_protocol()   # 'sixel', 'kitty', 'caca', or None
+            _dbg.debug('image protocol: %s', _IMG_PROTO)
+        if _IMG_PROTO and _CELL_PX is None:
+            _CELL_PX = _query_cell_pixels()
+            _dbg.debug('cell pixels: %s', _CELL_PX)
 
     image_popup:      Optional[ImagePopup] = None
     _hover_url:       str                  = ""   # currently open popup URL
@@ -3023,7 +3335,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         )
 
         # ── Hover image preview ───────────────────────────────────────
-        if _IMG_PROTO:
+        if _IMG_PROTO and ui.image_preview_enabled:
             _new_hover = ""
             if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
                 _ias = _get_interactables(ui.messages[ui.scroll_cursor].get("content", ""))
@@ -3113,9 +3425,16 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             await asyncio.sleep(0.02)
             continue
 
-        # Esc toggles the menu
+        # Esc: close popup if open (suppressed like H), otherwise toggle menu
         if key == '\x1b':
-            if ui.menu_open and ui.colour_pick_open:
+            if image_popup is not None:
+                _hover_suppressed = _hover_url or _hover_cand
+                image_popup.close()
+                image_popup = None
+                ui._overlay = None
+                _hover_url = _hover_cand = ""
+                ui.force_full_redraw()
+            elif ui.menu_open and ui.colour_pick_open:
                 ui.colour_pick_open = False  # back to main menu
             else:
                 ui.menu_open = not ui.menu_open
@@ -3127,6 +3446,13 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         if ui.menu_open:
             if await _handle_menu_key(key):
                 break
+            # If image preview was just disabled, close any open popup immediately
+            if not ui.image_preview_enabled and image_popup is not None:
+                image_popup.close()
+                image_popup = None
+                ui._overlay = None
+                _hover_url = _hover_cand = ""
+                ui.force_full_redraw()
             continue
 
         if key == '\t':
