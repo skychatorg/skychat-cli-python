@@ -1626,12 +1626,12 @@ def ncurses_login(stdscr, prefill_username: str = '',
     error_msg = ""
 
     LOGO = [
-        "  ███████╗██╗  ██╗██╗   ██╗ ██████╗██╗  ██╗ █████╗ ████████╗",
-        "  ██╔════╝██║ ██╔╝╚██╗ ██╔╝██╔════╝██║  ██║██╔══██╗╚══██╔══╝",
-        "  ███████╗█████╔╝  ╚████╔╝ ██║     ███████║███████║   ██║   ",
-        "  ╚════██║██╔═██╗   ╚██╔╝  ██║     ██╔══██║██╔══██║   ██║   ",
-        "  ███████║██║  ██╗   ██║   ╚██████╗██║  ██║██║  ██║   ██║   ",
-        "  ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ",
+        r"  ___________           _________ .__            __      ____/\__ __   ",
+        r" /   _____/  | _____.__.\\_   ___ \|  |__ _____ _/  |_   /   / /_/ \ \  ",
+        r" \_____  \|  |/ <   |  |/    \  \/|  |  \\__  \\   __\  \__/ / \   \ \ ",
+        r" /        \    < \___  |\     \___|   Y  \/ __ \|  |    / / /   \  / / ",
+        r"/_______  /__|_ \/ ____| \______  /___|  (____  /__|   /_/ /__  / /_/  ",
+        r"        \/     \/\/             \/     \/     \/         \/   \/       ",
     ]
 
     # Field navigation order depends on whether we have a token
@@ -1656,7 +1656,7 @@ def ncurses_login(stdscr, prefill_username: str = '',
             x = max(0, (W - len(line)) // 2)
             try:
                 stdscr.addstr(row, x, line[:W],
-                              curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
+                              curses.color_pair(C_USERNAME) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -2028,7 +2028,7 @@ class ChatUI:
         start = max(0, self.colour_pick_cursor - visible + 1)
         start = min(start, max(0, len(colours) - visible))
 
-        self._draw_box(box_y, box_x, box_h, box_w, title="  Pick colour  ")
+        self._draw_box(box_y, box_x, box_h, box_w, title="  Pick color  ")
         try:
             for row_i, idx in enumerate(range(start, start + visible)):
                 if idx >= len(colours):
