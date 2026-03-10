@@ -587,6 +587,10 @@ class SixelImagePopup:
             img_rows = max(1, round(self._px_h / cell_h_px))
             cx = self._img_cx + max(0, (self._img_cw - img_cols) // 2)
             cy = self._img_cy + max(0, (self._img_ch - img_rows) // 2)
+            # Blank the entire popup interior directly via terminal writes before
+            # placing the sixel — bypasses curses dirty tracking so no character
+            # from underlying windows can bleed through.
+            _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
             _sixel_place(self._sixel_data, cx, cy)
             # Remember where we placed it so close() can erase it
             self._placed_cx, self._placed_cy = cx, cy
