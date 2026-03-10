@@ -588,8 +588,18 @@ class SixelImagePopup:
             cx = self._img_cx + max(0, (self._img_cw - img_cols) // 2)
             cy = self._img_cy + max(0, (self._img_ch - img_rows) // 2)
             _sixel_place(self._sixel_data, cx, cy)
+            # Remember where we placed it so close() can erase it
+            self._placed_cx, self._placed_cy = cx, cy
+            self._placed_cols, self._placed_rows = img_cols, img_rows
             self._placed = True
-            _dbg.debug('_place() done at cell=(%d,%d)', cx, cy)
+            _dbg.debug('_place() done at cell=(%d,%d) size=(%d,%d)', cx, cy, img_cols, img_rows)
+
+    def erase_sixel(self) -> None:
+        """Overwrite the sixel pixel region with spaces, removing the image from screen."""
+        if self._placed:
+            # Clear the entire popup interior (not just the image) to catch all artifacts
+            _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
+            _dbg.debug('erase_sixel done')
 
     def draw(self) -> None:
         w  = self._win
@@ -617,7 +627,7 @@ class SixelImagePopup:
                     pass
             except curses.error:
                 pass
-            hint = ' scroll to close '
+            hint = ' Scroll/H = close · O = open in browser · ◀▶ = cycle '
             try:
                 w.addstr(0, max(2, (pw - len(hint)) // 2), hint, ab)
             except curses.error:
@@ -653,9 +663,10 @@ class SixelImagePopup:
         w.noutrefresh()
 
     def handle_key(self, key) -> bool:
-        return key in ('\x1b', 'q', 'Q', curses.KEY_BACKSPACE, 127)
+        return key in ('\x1b', 'q', 'Q', 'h', 'H', curses.KEY_BACKSPACE, 127)
 
     def close(self) -> None:
+        self.erase_sixel()          # overwrite sixel pixels with spaces first
         self._placed = False
         if self._win is not None:
             self._win.erase()
@@ -1634,6 +1645,23 @@ class ChatUI:
                                    curses.color_pair(swatch_pair) | curses.A_BOLD)
         except curses.error:
             pass
+
+    def force_full_redraw(self) -> None:
+        """Force a complete terminal repaint.
+        clearok tells curses to redraw every cell from scratch on the next
+        doupdate — this overwrites any sixel pixels left on screen."""
+        self.stdscr.clearok(True)
+        self.stdscr.touchwin()
+        self.stdscr.noutrefresh()
+        for w in (self.win_header, self.win_rooms, self.win_chat,
+                  self.win_input, self.win_users):
+            try:
+                w.clearok(True)
+                w.touchwin()
+                w.noutrefresh()
+            except Exception:
+                pass
+        curses.doupdate()
 
     def draw_all(self, rooms: List[Dict], current_room_id: Optional[int],
                  connected_list: List[Dict], own_username: str,
@@ -2888,6 +2916,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     _hover_url:       str                       = ""   # currently open popup URL
     _hover_cand:      str                       = ""   # current candidate (may differ from open)
     _hover_since:     float                     = 0.0  # when candidate last changed
+    _hover_suppressed: str                      = ""   # URL hidden with H — don't re-open until focus moves
     _HOVER_OPEN_MS  = 0.25   # seconds stable before opening
     _HOVER_CLOSE_MS = 0.40   # seconds empty before closing (tolerates transient resets)
 
@@ -2920,6 +2949,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     if _focused_kind == "url" and _is_image_url(_focused_val):
                         _new_hover = _focused_val
 
+            # Clear suppression once focus moves to a different URL (or no URL)
+            if _hover_suppressed and _new_hover != _hover_suppressed:
+                _hover_suppressed = ""
+
             _now = time.monotonic()
             if _new_hover != _hover_cand:
                 _hover_cand  = _new_hover
@@ -2928,8 +2961,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             _elapsed = _now - _hover_since
 
             if image_popup is None:
-                # Not open — open once candidate has been stable long enough
-                if _hover_cand and _elapsed >= _HOVER_OPEN_MS:
+                # Not open — open once candidate has been stable long enough,
+                # but not if the user explicitly hid this URL with H
+                if _hover_cand and _hover_cand != _hover_suppressed and _elapsed >= _HOVER_OPEN_MS:
                     _hover_url = _hover_cand
                     image_popup = SixelImagePopup(stdscr, _hover_url)
                     ui._overlay = image_popup
@@ -2944,11 +2978,13 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     image_popup = None
                     ui._overlay = None
                     _hover_url  = ""
+                    ui.force_full_redraw()  # erase sixel artifacts
                 elif _hover_cand and _hover_cand != _hover_url and _elapsed >= _HOVER_OPEN_MS:
                     _dbg.debug('popup switched: %r -> %r', _hover_url, _hover_cand)
                     image_popup.close()
                     image_popup = None
                     ui._overlay = None
+                    ui.force_full_redraw()  # erase previous sixel before new one loads
                     _hover_url  = _hover_cand
                     image_popup = SixelImagePopup(stdscr, _hover_url)
                     ui._overlay = image_popup
@@ -3020,6 +3056,17 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.cycle_focus(reverse=True)
             if rooms_list: ui.room_cursor = min(ui.room_cursor, len(rooms_list) - 1)
             if users_list: ui.user_cursor = min(ui.user_cursor, len(users_list) - 1)
+            continue
+
+        # H = hide image popup (stays hidden until focus moves to a different URL)
+        if key in ('h', 'H') and image_popup is not None:
+            _hover_suppressed = _hover_url or _hover_cand
+            image_popup.close()
+            image_popup = None
+            ui._overlay = None
+            _hover_url  = ""
+            _hover_cand = ""
+            ui.force_full_redraw()
             continue
 
         if ui.focus == Focus.ROOMS:
