@@ -2001,6 +2001,39 @@ INPUT_H   = 3   # minimum input box height (1 border top + 1 text + 1 border bot
 INPUT_H_MAX = 7  # maximum input box height (caps at 5 text lines)
 
 
+def _input_wrap_line(text: str, width: int) -> list:
+    """Word-aware wrap of a single logical input line into chunks of at most `width` cols.
+    Words are kept whole; only breaks mid-word if a single word exceeds width.
+    """
+    if not text:
+        return ['']
+    chunks: list = []
+    current = ''
+    for word in text.split(' '):
+        if not current:
+            while len(word) > width:
+                chunks.append(word[:width])
+                word = word[width:]
+            current = word
+        elif len(current) + 1 + len(word) <= width:
+            current += ' ' + word
+        else:
+            chunks.append(current)
+            current = ''
+            while len(word) > width:
+                chunks.append(word[:width])
+                word = word[width:]
+            current = word
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def _input_visual_rows(line: str, width: int) -> int:
+    """Number of visual rows a logical input line occupies after word-aware wrap."""
+    return max(1, len(_input_wrap_line(line, width)))
+
+
 class ChatUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -2070,8 +2103,7 @@ class ChatUI:
     def _update_input_height(self) -> bool:
         """Recompute input_h from current input_buf. Returns True if height changed."""
         vis_w = max(1, self.chat_w - 4)
-        lines = self.input_buf.split('\n')
-        visual_rows = sum(max(1, (len(ln) + vis_w - 1) // vis_w) for ln in lines)
+        visual_rows = sum(_input_visual_rows(ln, vis_w) for ln in self.input_buf.split('\n'))
         new_h = min(INPUT_H_MAX, max(INPUT_H, visual_rows + 2))  # +2 for borders
         if new_h != self.input_h:
             self.input_h = new_h
@@ -2907,20 +2939,19 @@ class ChatUI:
         logical_lines = self.input_buf.split('\n')
         char_idx = 0
         for li, line in enumerate(logical_lines):
-            # Split logical line into vis_w-wide chunks
-            chunks = [line[i:i+vis_w] for i in range(0, max(1, len(line)), vis_w)] if line else ['']
+            # Split logical line into word-aware chunks
+            chunks = _input_wrap_line(line, vis_w) if line else ['']
+            chunk_offset = 0
             for ci, chunk in enumerate(chunks):
                 vrow = len(visual_lines)
-                # Is cursor on this chunk?
-                chunk_start = char_idx + ci * vis_w
+                chunk_start = char_idx + chunk_offset
                 chunk_end   = chunk_start + len(chunk)
                 if chunk_start <= self.cursor_pos <= chunk_end:
-                    # cursor pos within this visual row
-                    local = self.cursor_pos - chunk_start
-                    if local <= len(chunk):
-                        cur_vrow = vrow
-                        cur_vcol = local
+                    cur_vrow = vrow
+                    cur_vcol = self.cursor_pos - chunk_start
                 visual_lines.append(chunk)
+                # +1 for the space consumed between wrapped words
+                chunk_offset += len(chunk) + (1 if ci < len(chunks) - 1 else 0)
             char_idx += len(line) + 1  # +1 for \n
 
         # Vertical scroll: keep cursor visible
@@ -3005,6 +3036,7 @@ class ChatUI:
         self.cursor_pos     = 0
         self.input_vscroll  = 0
         self.input_h        = INPUT_H
+        self._build_windows()
         return t
 
     def _user_colour_pair(self, xterm_idx: int) -> int:
