@@ -2881,14 +2881,20 @@ class ChatUI:
         w.erase()
 
         try:
-            if focused:
-                w.border()
-                w.addch(0, 0,       '╭', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-                w.addch(0, W - 1,   '╮', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-                w.addch(H - 1, 0,   '╰', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-                w.addch(H - 1, W-1, '╯', curses.color_pair(C_ITEM_ACTIVE) | curses.A_BOLD)
-            else:
-                w.border()
+            border_attr = curses.color_pair(C_BORDER) | (curses.A_BOLD if focused else 0)
+            w.border(0, 0, 0, 0, 0, 0, 0, 0)  # draw sides with bkgd attr first
+            # Redraw entire border with correct colour and rounded corners
+            H2, W2 = w.getmaxyx()
+            for col in range(1, W2 - 1):
+                w.addch(0,      col, '─', border_attr)
+                w.addch(H2 - 1, col, '─', border_attr)
+            for row in range(1, H2 - 1):
+                w.addch(row, 0,      '│', border_attr)
+                w.addch(row, W2 - 1, '│', border_attr)
+            w.addch(0,      0,      '╭', border_attr)
+            w.addch(0,      W2 - 1, '╮', border_attr)
+            w.addch(H2 - 1, 0,      '╰', border_attr)
+            w.addch(H2 - 1, W2 - 1, '╯', border_attr)
         except curses.error:
             pass
 
