@@ -2755,7 +2755,7 @@ class ChatUI:
 
         title = (" ▶ USERS" if focused else "   USERS") + f" — {len(connected_list)}"
         try:
-            w.addstr(0, 0, title[:W - 1].ljust(W - 1),
+            w.addstr(0, 0, title[:W].ljust(W),
                      curses.color_pair(C_HEADER) | curses.A_BOLD)
         except curses.error:
             pass
