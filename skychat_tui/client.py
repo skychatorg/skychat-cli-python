@@ -1011,16 +1011,7 @@ class ImagePopup:
         self._placed = False
         self._layout()
         if self._state == 'ready' and self._img_data:
-            if self._proto == 'caca':
-                # Caca renders ASCII art at fixed cell dimensions — re-render
-                # at the new window size, otherwise the old art is drawn into
-                # a differently-sized popup (clipped or overflowing).
-                self._img_data = None
-                self._state    = 'loading'
-                self._dirty    = True
-                asyncio.ensure_future(self.load())
-            else:
-                self._pending_place = True
+            self._pending_place = True
 
     async def load(self) -> None:
         _dbg.debug('load() proto=%s url=%s', self._proto, self.url)
@@ -1147,14 +1138,11 @@ class ImagePopup:
 
         # Pixel protocols (sixel / kitty)
         cx, cy = self._cell_pos()
+        # Blank interior first to prevent character bleed-through
+        _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
         if self._proto == 'kitty':
-            # Kitty: clear first (uses cell-based placement, needs clean cells)
-            _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
             _kitty_place(self._img_data, self._px_w, self._px_h, cx, cy)
         else:
-            # Sixel: skip the explicit clear — doupdate() already blanked these
-            # cells via the popup window repaint. Adding another clear doubles
-            # the blank→image gap and makes the flash worse on large images.
             _sixel_place(self._img_data, cx, cy)
         self._placed = True
         _dbg.debug('_place() pixel done at cell=(%d,%d)', cx, cy)
@@ -2859,7 +2847,7 @@ class ChatUI:
                 padded   = motto + "   "
                 loop_str = padded * 3   # enough to always find a full window
                 plen_ch  = len(padded)
-                phase_ch = int(time.monotonic() / self._MOTTO_CHAR_INTERVAL) % plen_ch
+                phase_ch = 0 if self._overlay is not None else int(time.monotonic() / self._MOTTO_CHAR_INTERVAL) % plen_ch
                 # Advance past `phase_ch` characters, then take up to motto_w cols
                 tail    = loop_str[phase_ch:]
                 visible = _cols_slice(tail, motto_w)
@@ -3735,15 +3723,24 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui._colour_pair_cache.clear()
             ui._next_pair = C_DYN_BASE
 
-        ui.draw_all(
-            rooms           = rooms_list,
-            current_room_id = client.current_room_id,
-            connected_list  = users_list,
-            own_username    = client.current_user.get("username", ""),
-            typing_list     = client.typing_list,
-            own_user        = client.current_user,
-            unread_checker  = client.has_unread_messages,
-        )
+        # While a sixel image is displayed, skip draw_all entirely to prevent
+        # any curses repaint from wiping the sixel pixels and causing a flash.
+        # Kitty stores images in terminal memory so doesn't need this guard.
+        _sixel_open = (ui._overlay is not None
+                       and ui._overlay._state == 'ready'
+                       and ui._overlay._proto == 'sixel'
+                       and ui._overlay._placed
+                       and not ui._overlay._pending_place)
+        if not _sixel_open:
+            ui.draw_all(
+                rooms           = rooms_list,
+                current_room_id = client.current_room_id,
+                connected_list  = users_list,
+                own_username    = client.current_user.get("username", ""),
+                typing_list     = client.typing_list,
+                own_user        = client.current_user,
+                unread_checker  = client.has_unread_messages,
+            )
 
         # ── Hover image preview ───────────────────────────────────────
         if _IMG_PROTO and ui.image_preview_enabled:
