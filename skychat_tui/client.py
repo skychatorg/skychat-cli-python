@@ -229,28 +229,56 @@ def _cols_slice(s: str, max_cols: int) -> str:
 
 
 def _cols_aware_wrap(text: str, width: int) -> List[str]:
-    """Column-aware line wrap.  Splits on whitespace and after ']' so that
-    runs of wide-character buttons never overflow the terminal width."""
+    """Word-aware, column-aware line wrap.  Keeps whole words together and
+    only breaks mid-word when a single word exceeds the available width.
+    Also splits after ']' so button runs don't overflow."""
     if not text:
         return [""]
+
+    # Split into tokens preserving spaces: alternate between word and space runs
+    import re as _re2
+    tokens = _re2.split(r'(\s+)', text)
+
     lines: List[str] = []
-    current = ""
+    current      = ""
     current_cols = 0
-    for ch in text:
-        ch_w = _char_width(ch)
-        if current_cols + ch_w > width:
-            if current:
-                lines.append(current)
-            current, current_cols = ch, ch_w
-        else:
-            current += ch
-            current_cols += ch_w
-            # Opportunistic split after ] or space when near the limit
-            if ch in (']', ' ') and current_cols >= width - 3:
+
+    for token in tokens:
+        if not token:
+            continue
+        token_cols = _str_cols(token)
+
+        if current_cols + token_cols <= width:
+            # Token fits on current line
+            current      += token
+            current_cols += token_cols
+        elif token_cols > width:
+            # Token is wider than the line — must break it character by character
+            # First flush current line
+            if current.strip():
                 lines.append(current.rstrip())
-                current, current_cols = "", 0
+            current, current_cols = "", 0
+            for ch in token:
+                ch_w = _char_width(ch)
+                if current_cols + ch_w > width:
+                    if current:
+                        lines.append(current)
+                    current, current_cols = ch, ch_w
+                else:
+                    current      += ch
+                    current_cols += ch_w
+        else:
+            # Token doesn't fit — flush current line and start fresh
+            if current.strip():
+                lines.append(current.rstrip())
+            # Don't carry leading whitespace to a new line
+            stripped = token.lstrip()
+            current      = stripped
+            current_cols = _str_cols(stripped)
+
     if current.strip():
-        lines.append(current)
+        lines.append(current.rstrip())
+
     return lines or [""]
 
 
@@ -449,6 +477,153 @@ _logging.basicConfig(filename='/tmp/skychat_img_debug.log', level=_logging.DEBUG
                      format='%(asctime)s %(message)s')
 _dbg = _logging.getLogger('img')
 
+
+# ── Upload capability detection ────────────────────────────────────────────
+
+def _detect_upload() -> Optional[str]:
+    """Detect which clipboard image tool is available.
+    Returns 'aiohttp', 'xclip', 'wl-paste', 'pbpaste', or None."""
+    try:
+        import aiohttp as _aiohttp  # noqa: F401
+        return 'aiohttp'
+    except ImportError:
+        pass
+    # aiohttp not available — still support file:// / path paste via stdlib
+    # but check for clipboard image tools
+    import shutil
+    if shutil.which('xclip'):
+        return 'xclip'
+    if shutil.which('wl-paste'):
+        return 'wl-paste'
+    if shutil.which('pbpaste'):
+        return 'pbpaste'
+    return None
+
+_UPLOAD_METHOD: Optional[str] = None   # set lazily on first use
+
+def _get_upload_method() -> Optional[str]:
+    global _UPLOAD_METHOD
+    if _UPLOAD_METHOD is None:
+        _UPLOAD_METHOD = _detect_upload() or 'stdlib'
+    return _UPLOAD_METHOD
+
+def _wss_to_http(wss_url: str) -> str:
+    """Convert wss://host/path to https://host"""
+    return wss_url.replace('wss://', 'https://').replace('ws://', 'http://').split('/api/')[0]
+
+async def _upload_file_bytes(data: bytes, filename: str, base_url: str,
+                              token: Optional[dict] = None) -> str:
+    """Upload raw bytes as multipart/form-data. Returns the full URL of the uploaded file.
+
+    Auth strategy: SkyChat's web client uses a browser session cookie the TUI never
+    receives. We instead send the auth token in every way the server might accept:
+    - As a 'token' query parameter in the URL
+    - As a 'token' field in the multipart form body
+    - As an Authorization header (Bearer)
+    """
+    import uuid
+    token_json = json.dumps(token) if token else None
+
+    endpoint = base_url.rstrip('/') + '/api/upload'
+    method = _get_upload_method()
+
+    # The upload plugin has no auth — but the reverse proxy may enforce CSRF checks.
+    # Mimic a browser request: send Origin + Referer so the proxy accepts us.
+    browser_headers = {
+        'Origin':  base_url,
+        'Referer': base_url + '/',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) skychat-tui/1.0',
+    }
+
+    # ── aiohttp path ──────────────────────────────────────────────────
+    if method == 'aiohttp':
+        import aiohttp
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            form = aiohttp.FormData()
+            import mimetypes as _mt
+            mime = _mt.guess_type(filename)[0] or 'image/png'
+            form.add_field('file', data, filename=filename,
+                           content_type=mime)
+            async with session.post(endpoint, data=form, headers=browser_headers,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 403:
+                    body = await resp.text()
+                    raise RuntimeError(f'403 Forbidden: {body[:120]}')
+                result = await resp.json(content_type=None)
+    else:
+        # ── stdlib urllib multipart path ──────────────────────────────
+        import urllib.request, urllib.error
+        boundary = uuid.uuid4().hex
+        parts = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f'Content-Type: {__import__("mimetypes").guess_type(filename)[0] or "image/png"}\r\n\r\n'
+        ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
+        headers = {
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            **browser_headers,
+        }
+        req = urllib.request.Request(endpoint, data=parts, headers=headers, method='POST')
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        loop = asyncio.get_running_loop()
+        def _do_req():
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors='replace')[:120]
+                raise RuntimeError(f'{e.code} {e.reason}: {body}')
+        result = await loop.run_in_executor(None, _do_req)
+
+    if result.get('status') == 500:
+        raise RuntimeError(result.get('message', 'Upload failed'))
+    path = result.get('path', '')
+    return base_url.rstrip('/') + '/' + path.lstrip('/')
+
+async def _upload_local_file(path: str, base_url: str,
+                              token: Optional[dict] = None) -> str:
+    """Read a local file and upload it."""
+    import os.path, mimetypes
+    path = path.strip()
+    if not os.path.isfile(path):
+        raise RuntimeError(f'File not found: {path}')
+    filename = os.path.basename(path)
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, lambda: open(path, 'rb').read())
+    return await _upload_file_bytes(data, filename, base_url, token)
+
+async def _grab_clipboard_image() -> Optional[bytes]:
+    """Try to grab image bytes from the system clipboard. Returns None if unavailable."""
+    method = _get_upload_method()
+    loop   = asyncio.get_running_loop()
+    try:
+        if method == 'xclip':
+            proc = await asyncio.create_subprocess_exec(
+                'xclip', '-selection', 'clipboard', '-t', 'image/png', '-o',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            return out if proc.returncode == 0 and out else None
+        elif method == 'wl-paste':
+            proc = await asyncio.create_subprocess_exec(
+                'wl-paste', '--type', 'image/png',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            return out if proc.returncode == 0 and out else None
+        elif method == 'pbpaste':
+            # pbpaste doesn't support image; try osascript
+            script = 'set img to (the clipboard as «class PNGf»)\nreturn img'
+            proc = await asyncio.create_subprocess_exec(
+                'osascript', '-e', script,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            return out if proc.returncode == 0 and out else None
+    except Exception:
+        pass
+    return None
 
 # ── Sixel ──────────────────────────────────────────────────────────────────
 
@@ -2653,10 +2828,12 @@ class ChatUI:
                     name_attr  = curses.color_pair(C_ITEM_IDLE)
                     motto_attr = curses.color_pair(C_ITEM_IDLE)
 
-            # Name row
+            # Name row — dot occupies a fixed 2-cell slot (col 2–3) so that
+            # ambiguous-width characters like ◐ never bleed into the username.
             try:
                 w.addstr(row, 1, " " * (W - 2), name_attr)
                 w.addstr(row, 2, dot,            dot_attr)
+                w.addstr(row, 3, " ",            name_attr)   # clear second cell of slot
                 w.addstr(row, 4, uname[:W - 5],  name_attr)
             except curses.error:
                 pass
@@ -2895,6 +3072,11 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         curses.set_escdelay(25)  # Python 3.9+; silently ignored if unavailable
     except AttributeError:
         pass
+
+    # Enable bracketed paste mode: terminal wraps pastes in \x1b[200~ ... \x1b[201~
+    # so we receive the whole paste at once instead of char-by-char.
+    sys.stdout.write('\x1b[?2004h')
+    sys.stdout.flush()
 
     ui     = ChatUI(stdscr)
     client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
@@ -3431,6 +3613,82 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         return False
 
+    # ── Paste handler ────────────────────────────────────────────────
+    _upload_base_url = _wss_to_http(DEFAULT_WSS_URL)
+
+    async def _handle_paste(text: str) -> None:
+        """Process pasted text: upload if it looks like a file path or image,
+        otherwise bulk-insert into the input buffer (fast, no per-char redraw)."""
+        stripped = text.strip()
+
+        # ── Try clipboard image upload first (only when text is empty/whitespace) ──
+        if not stripped and _get_upload_method() not in (None, 'stdlib'):
+            img_bytes = await _grab_clipboard_image()
+            if img_bytes:
+                ui.set_status('⬆ Uploading image…', ttl=30)
+                try:
+                    url = await _upload_file_bytes(
+                        img_bytes, 'paste.png', _upload_base_url,
+                        client.token)
+                    if ui.scroll_cursor < 0:
+                        if ui.input_buf and not ui.input_buf.endswith(' '):
+                            ui.input_buf += ' '
+                        ui.input_buf += url
+                        ui.cursor_pos = len(ui.input_buf)
+                    ui.set_status('✓ Image uploaded', ttl=3)
+                except Exception as e:
+                    ui.set_status(f'✗ Upload failed: {e}', ttl=5)
+                return
+
+        # ── Detect file:// URI (drag-drop from file manager) ──────────
+        if stripped.startswith('file://'):
+            local_path = stripped[7:]   # strip file://
+            # Strip hostname if present (file:///home/... → /home/...)
+            if local_path.startswith('/') and not local_path.startswith('//'):
+                pass  # already a bare path
+            elif local_path.startswith('//'):
+                # file:///path or file://host/path
+                local_path = '/' + local_path.lstrip('/')
+            import urllib.parse as _up
+            local_path = _up.unquote(local_path)
+            ui.set_status(f'⬆ Uploading {os.path.basename(local_path)}…', ttl=30)
+            try:
+                url = await _upload_local_file(local_path, _upload_base_url, client.token)
+                if ui.scroll_cursor < 0:
+                    if ui.input_buf and not ui.input_buf.endswith(' '):
+                        ui.input_buf += ' '
+                    ui.input_buf += url
+                    ui.cursor_pos = len(ui.input_buf)
+                ui.set_status('✓ Uploaded', ttl=3)
+            except Exception as e:
+                ui.set_status(f'✗ Upload failed: {e}', ttl=5)
+            return
+
+        # ── Detect bare local file path ────────────────────────────────
+        import os.path as _osp
+        if stripped and _osp.isabs(stripped) and _osp.isfile(stripped):
+            ui.set_status(f'⬆ Uploading {os.path.basename(stripped)}…', ttl=30)
+            try:
+                url = await _upload_local_file(stripped, _upload_base_url, client.token)
+                if ui.scroll_cursor < 0:
+                    if ui.input_buf and not ui.input_buf.endswith(' '):
+                        ui.input_buf += ' '
+                    ui.input_buf += url
+                    ui.cursor_pos = len(ui.input_buf)
+                ui.set_status('✓ Uploaded', ttl=3)
+            except Exception as e:
+                ui.set_status(f'✗ Upload failed: {e}', ttl=5)
+            return
+
+        # ── Plain text paste — bulk insert (fast, single redraw) ──────
+        if ui.scroll_cursor < 0 and ui.focus == Focus.INPUT:
+            # Normalise \r\n and \r to \n
+            text = text.replace('\r\n', '\n').replace('\r', '\n')
+            before = ui.input_buf[:ui.cursor_pos]
+            after  = ui.input_buf[ui.cursor_pos:]
+            ui.input_buf  = before + text + after
+            ui.cursor_pos = len(before) + len(text)
+
     # ── Main loop ─────────────────────────────────────────────────────
 
     global _IMG_PROTO, _CELL_PX
@@ -3560,11 +3818,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             await asyncio.sleep(0.02)
             continue
 
-        # Detect Shift+Enter: \x1b followed immediately by \r or \n (Alt+Enter in many
-        # terminals), or the kitty/CSI-u sequence \x1b[13;2u.
-        # We peek at the next character(s) with a very short timeout.
+        # Detect Shift+Enter and bracketed paste sequences starting with \x1b.
+        # We peek at the next character(s) non-blockingly to classify the sequence.
         if key == '\x1b':
-            # Try to read the next char non-blockingly
             try:
                 k2 = stdscr.get_wch()
                 if k2 in ('\r', '\n', 10):
@@ -3573,27 +3829,68 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                         ui.insert_char('\n')
                     continue
                 elif k2 == '[':
-                    # Possibly CSI sequence — read more
+                    # CSI sequence — read until alpha terminator
                     try:
                         rest = ''
                         while True:
                             k3 = stdscr.get_wch()
                             rest += (k3 if isinstance(k3, str) else chr(k3))
-                            if rest[-1].isalpha():
+                            if rest[-1].isalpha() or rest.endswith('~'):
                                 break
-                            if len(rest) > 10:
+                            if len(rest) > 20:
                                 break
                         if rest == '13;2u':
                             # Kitty Shift+Enter
                             if ui.focus == Focus.INPUT and ui.scroll_cursor < 0:
                                 ui.insert_char('\n')
                             continue
+                        elif rest == '200~':
+                            # ── Bracketed paste start ─────────────────────────
+                            # Drain everything until \x1b[201~ into paste_buf
+                            paste_buf = ''
+                            _ESC_seen = False
+                            while True:
+                                try:
+                                    pc = stdscr.get_wch()
+                                except curses.error:
+                                    await asyncio.sleep(0.005)
+                                    continue
+                                pc = pc if isinstance(pc, str) else chr(pc)
+                                if _ESC_seen:
+                                    if pc == '[':
+                                        # Read rest of potential 201~ terminator
+                                        term = ''
+                                        while True:
+                                            try:
+                                                tc = stdscr.get_wch()
+                                            except curses.error:
+                                                await asyncio.sleep(0.002)
+                                                continue
+                                            term += tc if isinstance(tc, str) else chr(tc)
+                                            if term.endswith('~') or (term and term[-1].isalpha()):
+                                                break
+                                            if len(term) > 10:
+                                                break
+                                        if term == '201~':
+                                            break  # end of paste
+                                        else:
+                                            paste_buf += '\x1b[' + term
+                                    else:
+                                        paste_buf += '\x1b' + pc
+                                    _ESC_seen = False
+                                elif pc == '\x1b':
+                                    _ESC_seen = True
+                                else:
+                                    paste_buf += pc
+
+                            # ── Process the pasted content ────────────────────
+                            await _handle_paste(paste_buf)
+                            continue
                         # Unknown CSI — fall through to Esc handling, discard rest
                     except curses.error:
                         pass
                 else:
-                    # Some other Alt+key — re-queue k2 by handling Esc first then key
-                    # For now just handle Esc and discard (rare edge case)
+                    # Some other Alt+key — discard k2, handle as plain Esc
                     pass
             except curses.error:
                 pass  # No next char — plain Esc
@@ -3660,7 +3957,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         await asyncio.sleep(0.02)
 
-    # Cleanup
+    # Cleanup — restore terminal to normal paste mode
+    sys.stdout.write('\x1b[?2004l')
+    sys.stdout.flush()
     client._running = False
     await client.disconnect()
     conn_task.cancel()
