@@ -1,27 +1,40 @@
 # skychat-tui
 
-Terminal client for [skych.at](https://skych.at), built with Python and curses.
+```
+  ___________           _________ .__            __      ____/\__ __   
+ /   _____/  | _____.__.\\_   ___ \|  |__ _____ _/  |_   /   / /_/ \ \ 
+ \_____  \|  |/ <   |  |/    \  \/|  |  \__  \\   __\  \__/ / \   \ \
+ /        \    < \___  |\     \___|   Y  \/ __ \|  |    / / /   \  / /
+/_______  /__|_ \/ ____| \______  /___|  (____  /__|   /_/ /__  / /_/ 
+        \/     \/\/             \/     \/     \/         \/   \/      
+```
 
-## Install
+> a terminal chat client for [skych.at](https://skych.at). no electron. no browser. just vibes and escape codes.
+
+[![WTFPL](http://www.wtfpl.net/wp-content/uploads/2012/12/wtfpl-badge-4.png)](http://www.wtfpl.net/)
+
+---
+
+## install
 
 ```bash
 pip install .
 ```
 
-Or for development (editable install — changes to the source take effect immediately):
+or dev mode (edits take effect immediately):
 
 ```bash
 pip install -e .
 ```
 
-## Usage
+## usage
 
 ```bash
-skychat                      # opens login screen (username pre-filled from last session)
-skychat username password    # skip login screen
+skychat                      # login screen
+skychat username password    # skip the formalities
 ```
 
-## Layout
+## layout
 
 ```
 ┌──────────┬─────────────────────────┬──────────┐
@@ -31,115 +44,109 @@ skychat username password    # skip login screen
 └──────────┴─────────────────────────┴──────────┘
 ```
 
-Tab cycles focus between the three panels. The active panel is indicated by a `▶` in its title.
+`Tab` cycles focus between panels. The active panel gets a `▶` in its title.
 
-## Keys
+## keys
 
-### Navigation
+### navigation
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Cycle focus: Input → Rooms → Users → Input |
-| `↑` / `↓` (Rooms focus) | Move room cursor |
-| `Enter` (Rooms focus) | Join selected room |
-| `Backspace` (Rooms focus) | Leave selected DM / private room |
-| `↑` / `↓` (Users focus) | Move user cursor |
-| `Enter` (Users focus) | Open DM with selected user |
+| `↑` / `↓` (Rooms) | Move room cursor |
+| `Enter` (Rooms) | Join selected room |
+| `Backspace` (Rooms) | Leave selected DM / private room |
+| `↑` / `↓` (Users) | Move user cursor |
+| `Enter` (Users) | Open DM with selected user |
 
-### Messages (Input focus)
+### messages (Input focus)
 
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Enter scroll mode / move message selection |
 | `Shift+↑` | Scroll up 5 messages |
 | `Shift+↓` | Snap back to bottom |
-| `Space` (while scrolled) | Quote selected message — prefills `@<id>` in input |
-| `e` (while scrolled) | Edit selected message (own messages only) |
-| `Backspace` (while scrolled) | Delete selected message (own messages only) |
-| `<` / `>` (while scrolled) | Cycle between URLs/buttons in selected message |
-| `o` (while scrolled) | Open focused URL in browser / activate focused button |
+| `Space` (scrolled) | Quote selected message — prefills `@<id>` in input |
+| `e` (scrolled) | Edit selected message (yours only) |
+| `Backspace` (scrolled) | Delete selected message (yours only) |
+| `<` / `>` (scrolled) | Cycle between URLs/buttons in selected message |
+| `o` (scrolled) | Open focused URL in browser / activate button |
 | `Esc` | Close image preview (if open), otherwise open/close menu |
 
-### Input editing
+### input editing
 
 | Key | Action |
 |-----|--------|
 | `←` / `→` | Move cursor |
-| `Home` / `End` | Jump to start/end of input |
+| `Home` / `End` | Jump to start/end |
 | `Backspace` / `Del` | Delete character |
 | `Enter` | Send message |
 
-### Image preview
+### image preview
 
-When a message is selected and the focused link is an image URL, a preview popup appears automatically after a short hover delay.
+Hover over an image URL in scroll mode and a preview popup appears automatically. Kitty and sixel render full colour pixels; libcaca falls back to coloured ASCII art.
 
 | Key | Action |
 |-----|--------|
-| `H` | Hide popup (stays hidden until focus moves to a different URL) |
-| `Esc` | Hide popup (same suppression behaviour as `H`) |
-| `O` | Open image URL in browser |
-| `<` / `>` | Cycle to previous/next link in the message |
+| `H` | Hide popup (suppressed until focus moves to a different URL) |
+| `Esc` | Same as `H` |
+| `O` | Open image in browser |
+| `<` / `>` | Cycle to prev/next link in the message |
 
-The popup closes automatically when focus moves away from the image URL.
-
-## Slash commands
+## slash commands
 
 | Command | Action |
 |---------|--------|
-| `/quit` | Exit |
-| `/join <id>` | Join room by ID |
-| `/rooms` | List available rooms in the status bar |
-| `/who` | List online users in the status bar |
-| `/history` | Fetch older message history |
+| `/quit` | get out |
+| `/join <id>` | join room by ID |
+| `/rooms` | list rooms in the status bar |
+| `/who` | list online users in the status bar |
+| `/history` | fetch older message history |
 
-## Menu
+## menu
 
-Press `Esc` to open the menu (when no image preview is open). Use `↑`/`↓` to navigate, `Enter` to select.
+`Esc` opens the menu (when no image preview is open). `↑`/`↓` to navigate, `Enter` to select.
 
 | Item | Action |
 |------|--------|
-| Cycle theme | Step through available themes: Dracula, Nord, Gruvbox, Solarized Dark, Tokyo Night, Monokai |
-| Toggle notifications | Enable/disable desktop notifications and terminal bell |
-| Image Preview | Enable/disable inline image preview (persisted to config) |
-| Pick colour | Set your username colour (loaded from server) |
-| Logout | Clear saved token and exit |
-| Quit | Exit without clearing token |
+| Cycle theme | Dracula → Nord → Gruvbox → Solarized Dark → Tokyo Night → Monokai |
+| Toggle notifications | desktop notifications + terminal bell |
+| Image Preview | toggle inline image preview (persisted to config) |
+| Pick color | set your username color |
+| Logout | nuke saved token and exit |
+| Quit | exit without clearing token |
 
-## Config
+## config
 
-Settings are saved to `~/.skychat_tui.json`:
+lives at `~/.skychat_tui.json`:
 
-| Key | Description |
-|-----|-------------|
-| `username` | Pre-fills the login screen |
-| `token` | Saved auth token for resuming sessions without re-entering credentials |
-| `theme` | Active colour theme (default: `Dracula`) |
-| `notifications` | Whether desktop notifications are enabled (default: `true`) |
-| `image_preview` | Whether inline image preview is enabled (default: `true`) |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `username` | — | pre-fills the login screen |
+| `token` | — | saved auth token |
+| `theme` | `Dracula` | active color theme |
+| `notifications` | `true` | desktop notifications |
+| `image_preview` | `true` | inline image preview |
 
-## Requirements
+## requirements
 
 - Python 3.10+
-- `websockets` (installed automatically)
-- A terminal with 256-colour support
+- `websockets`
+- a terminal with 256-colour support
 
-### Optional — image preview
+### optional — image preview
 
-Image preview is auto-detected at startup and disabled gracefully if none of the following are available:
+auto-detected at startup, fails gracefully if nothing's available:
 
-| Method | What's needed | Quality |
-|--------|---------------|---------|
-| Sixel | `Pillow` + a sixel terminal (foot, iTerm2, mlterm) | Full colour pixel image |
-| Kitty | `Pillow` + kitty terminal | Full colour pixel image |
-| libcaca | `img2txt` (libcaca-utils) or `python-caca` bindings | Coloured ASCII art fallback |
-
-Install Pillow for sixel/kitty support:
+| Method | Requirements | Notes |
+|--------|--------------|-------|
+| **Kitty** | `Pillow` + kitty terminal | best quality, no flicker |
+| **Sixel** | `Pillow` + sixel terminal (foot, iTerm2, mlterm) | good quality, minor flicker |
+| **libcaca** | `img2txt` or `python-caca` | coloured ASCII art, works anywhere |
 
 ```bash
 pip install Pillow
 ```
-
-Install libcaca for the ASCII art fallback (works in any 256-colour terminal):
 
 ```bash
 # Debian/Ubuntu
