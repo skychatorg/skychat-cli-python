@@ -2537,10 +2537,13 @@ class ChatUI:
         # ── Wrapped content lines ─────────────────────────────────────
         _msg_interactables = _get_interactables(msg_content)
         wrapped = []
+        wrapped_meta = []  # (chunk, chunk_urls, chunk_btns, is_greentext)
         for _ln in msg_content.split("\n"):
-            wrapped.extend(ChatUI._wrap_with_spans(_ln, max(8, usable_w - prefix)))
+            _is_gt = _ln.lstrip().startswith(">")
+            for item in ChatUI._wrap_with_spans(_ln, max(8, usable_w - prefix)):
+                wrapped_meta.append(item + (_is_gt,))
 
-        for wi, (chunk, chunk_urls, chunk_btns) in enumerate(wrapped):
+        for wi, (chunk, chunk_urls, chunk_btns, is_greentext) in enumerate(wrapped_meta):
             if row >= H - 1:
                 break
             is_first = (wi == 0)
@@ -2630,7 +2633,7 @@ class ChatUI:
                         col += len(needle)
                         i2 = pos + len(needle)
                 else:
-                    _draw_segment(remaining, sel_a if is_sel else 0)
+                    _draw_segment(remaining, sel_a if is_sel else (curses.color_pair(C_USER_ONLINE) if is_greentext else 0))
             except curses.error:
                 pass
             row += 1
