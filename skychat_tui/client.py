@@ -2174,7 +2174,7 @@ class ChatUI:
         inner_x = box_x + 2
         inner_w = box_w - 4
 
-        self._draw_box(box_y, box_x, box_h, box_w, title="  Menu  ")
+        self._draw_box(box_y, box_x, box_h, box_w, title="  Menu — Esc to close  ")
         try:
             for i, item in enumerate(items):
                 row    = box_y + 2 + i
@@ -3919,6 +3919,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui._overlay = None
                 _hover_url = _hover_cand = ""
                 ui.force_full_redraw()
+                ui.menu_open = True
+                ui.menu_cursor = 0
+                ui.colour_pick_open = False
             elif ui.menu_open and ui.colour_pick_open:
                 ui.colour_pick_open = False  # back to main menu
             else:
