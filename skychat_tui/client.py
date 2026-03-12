@@ -1011,7 +1011,16 @@ class ImagePopup:
         self._placed = False
         self._layout()
         if self._state == 'ready' and self._img_data:
-            self._pending_place = True
+            if self._proto == 'caca':
+                # Caca renders ASCII art at fixed cell dimensions — re-render
+                # at the new window size, otherwise the old art is drawn into
+                # a differently-sized popup (clipped or overflowing).
+                self._img_data = None
+                self._state    = 'loading'
+                self._dirty    = True
+                asyncio.ensure_future(self.load())
+            else:
+                self._pending_place = True
 
     async def load(self) -> None:
         _dbg.debug('load() proto=%s url=%s', self._proto, self.url)
@@ -1138,11 +1147,14 @@ class ImagePopup:
 
         # Pixel protocols (sixel / kitty)
         cx, cy = self._cell_pos()
-        # Blank interior first to prevent character bleed-through
-        _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
         if self._proto == 'kitty':
+            # Kitty: clear first (uses cell-based placement, needs clean cells)
+            _sixel_clear(self._img_cx, self._img_cy, self._img_cw, self._img_ch)
             _kitty_place(self._img_data, self._px_w, self._px_h, cx, cy)
         else:
+            # Sixel: skip the explicit clear — doupdate() already blanked these
+            # cells via the popup window repaint. Adding another clear doubles
+            # the blank→image gap and makes the flash worse on large images.
             _sixel_place(self._img_data, cx, cy)
         self._placed = True
         _dbg.debug('_place() pixel done at cell=(%d,%d)', cx, cy)
