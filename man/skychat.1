@@ -1,0 +1,258 @@
+.TH SKYCHAT 1 "2026" "skychat-tui" "User Commands"
+.SH NAME
+skychat \- terminal client for skych.at
+.SH SYNOPSIS
+.B skychat
+[\fIusername\fR [\fIpassword\fR]]
+[\fB\-\-debug\fR]
+.SH DESCRIPTION
+.B skychat
+is a curses-based terminal client for the SkyChat chat service at
+.IR skych.at .
+It provides a three-panel layout with a channel list, chat view, and user list,
+and supports inline image preview via Kitty, Sixel, or libcaca protocols.
+.PP
+Without arguments, an interactive login screen is shown with the username
+pre-filled from the saved config if available. Credentials can also be passed
+directly on the command line to skip the login screen.
+.SH OPTIONS
+.TP
+.I username
+Username to log in with. If omitted, the login screen is shown.
+.TP
+.I password
+Password to log in with. Required if \fIusername\fR is given.
+.TP
+.B \-\-debug
+Write crash tracebacks to
+.I /tmp/skychat_crash.log
+instead of silently exiting.
+.SH LAYOUT
+.PP
+The interface is divided into three vertical panels:
+.PP
+.nf
+┌──────────┬─────────────────────────┬──────────┐
+│ Channels │      Chat messages      │  Users   │
+│          ├─────────────────────────┤          │
+│          │    Input box            │          │
+└──────────┴─────────────────────────┴──────────┘
+.fi
+.PP
+.B Tab
+cycles focus between panels. The active panel is indicated by a
+.B ▶
+in its title.
+.SH KEYS
+.SS Navigation
+.TP
+.BR Tab / Shift+Tab
+Cycle focus: Input \(-> Rooms \(-> Users \(-> Input.
+.TP
+.BR \(ua / \(da " (Rooms focus)"
+Move room cursor.
+.TP
+.BR Enter " (Rooms focus)"
+Join selected room.
+.TP
+.BR Backspace " (Rooms focus)"
+Leave selected DM or private room.
+.TP
+.BR \(ua / \(da " (Users focus)"
+Move user cursor.
+.TP
+.BR Enter " (Users focus)"
+Open DM with selected user.
+.SS Messages (Input focus)
+.TP
+.BR \(ua / \(da
+Enter scroll mode and move message selection.
+.TP
+.B Shift+\(ua
+Scroll up 5 messages.
+.TP
+.B Shift+\(da
+Snap back to the bottom.
+.TP
+.BR Space " (while scrolled)"
+Quote selected message \(em prefills
+.B @<id>
+in the input box.
+.TP
+.BR e " (while scrolled)"
+Edit selected message (own messages only).
+.TP
+.BR Backspace " (while scrolled)"
+Delete selected message (own messages only).
+.TP
+.BR < " / " >  " (while scrolled)"
+Cycle between URLs and buttons in the selected message.
+.TP
+.BR o " (while scrolled)"
+Open focused URL in browser or activate focused button.
+.TP
+.B Esc
+Close image preview if open (then open menu), otherwise toggle menu.
+.SS Input Editing
+.TP
+.BR \(la / \(ra
+Move cursor left or right.
+.TP
+.BR Home / End
+Jump to start or end of input.
+.TP
+.BR Backspace / Del
+Delete character.
+.TP
+.B Enter
+Send message.
+.PP
+Multi-line messages can be composed with
+.BR Alt+Enter " or " Shift+Enter .
+The input box grows up to 5 lines and shrinks back after sending.
+Lines beginning with
+.B >
+are rendered as greentext.
+.SS Image Preview
+.PP
+When a message is selected in scroll mode and the focused link is an image URL,
+a preview popup appears automatically after a short hover delay.
+.TP
+.BR H " or " Esc
+Hide popup (suppressed until focus moves to a different URL). Esc also opens the menu.
+.TP
+.B O
+Open the image URL in the default browser.
+.TP
+.BR < " / " >
+Cycle to the previous or next link in the message.
+.SH SLASH COMMANDS
+.TP
+.B /quit
+Exit the client.
+.TP
+.B /join\fR \fIid\fR
+Join room by numeric ID.
+.TP
+.B /rooms
+List available rooms in the status bar.
+.TP
+.B /who
+List online users in the status bar.
+.TP
+.B /history
+Fetch older message history.
+.SH MENU
+Press
+.B Esc
+to open the menu (when no image preview is open). Use
+.BR \(ua / \(da
+to navigate and
+.B Enter
+to select.
+.TP
+.B Cycle theme
+Step through available colour themes:
+Dracula, Nord, Gruvbox, Solarized Dark, Tokyo Night, Monokai.
+.TP
+.B Toggle notifications
+Enable or disable desktop notifications and terminal bell.
+.TP
+.B Image Preview
+Toggle inline image preview (persisted to config).
+.TP
+.B Pick color
+Set your username colour (loaded from server).
+.TP
+.B Logout
+Clear saved token and exit.
+.TP
+.B Quit
+Exit without clearing token.
+.SH CONFIGURATION
+Settings are persisted to
+.IR ~/.skychat_tui.json .
+.TP
+.B username
+Pre-fills the login screen.
+.TP
+.B token
+Saved auth token for resuming sessions without re-entering credentials.
+.TP
+.B theme
+Active colour theme. Default:
+.IR Dracula .
+.TP
+.B notifications
+Whether desktop notifications are enabled. Default:
+.IR true .
+.TP
+.B image_preview
+Whether inline image preview is enabled. Default:
+.IR true .
+.SH IMAGE PREVIEW
+Image preview is auto-detected at startup and disabled gracefully if none of the
+following are available:
+.TP
+.B Kitty
+Requires
+.B Pillow
+and the Kitty terminal emulator. Best quality, no flicker.
+.TP
+.B Sixel
+Requires
+.B Pillow
+and a Sixel-capable terminal (foot, iTerm2, mlterm). Good quality, minor flicker.
+.TP
+.B libcaca
+Requires
+.B img2txt
+(from
+.BR libcaca-utils )
+or the
+.B python-caca
+bindings. Coloured ASCII art fallback, works in any 256-colour terminal.
+.SH FILES
+.TP
+.I ~/.skychat_tui.json
+User configuration and saved auth token.
+.TP
+.I /tmp/skychat_crash.log
+Crash traceback written when
+.B \-\-debug
+is passed.
+.SH ENVIRONMENT
+.TP
+.B ESCDELAY
+ncurses ESC disambiguation delay in milliseconds. Automatically set to
+.B 25
+by the client to reduce latency.
+.SH EXAMPLES
+.TP
+Open the login screen:
+.B skychat
+.TP
+Log in directly:
+.B skychat alice hunter2
+.TP
+Log in with crash logging enabled:
+.B skychat alice hunter2 \-\-debug
+.SH REQUIREMENTS
+Python 3.10 or later.
+The
+.B websockets
+package (installed automatically via pip).
+A terminal with 256-colour support.
+.SH BUGS
+Sixel image preview may flicker on large images due to the nature of the Sixel
+protocol interacting with curses repaints. Use Kitty protocol for flicker-free
+image display.
+.SH SEE ALSO
+.BR curl (1),
+.BR python3 (1)
+.PP
+SkyChat web client: https://skych.at
+.SH LICENSE
+WTFPL \(em Do What the Fuck You Want to Public License.
+.br
+See http://www.wtfpl.net/ for details.
