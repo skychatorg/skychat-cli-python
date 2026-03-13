@@ -32,6 +32,13 @@ pip install -e .
 ```bash
 skychat                      # login screen
 skychat username password    # skip the formalities
+skychat --debug              # write crashes to /tmp/skychat_crash.log
+```
+
+Override the server URL:
+
+```bash
+SKYCHAT_URL=wss://localhost:8080/api/ws skychat
 ```
 
 ## layout
@@ -70,7 +77,7 @@ skychat username password    # skip the formalities
 | `e` (scrolled) | Edit selected message (yours only) |
 | `Backspace` (scrolled) | Delete selected message (yours only) |
 | `<` / `>` (scrolled) | Cycle between URLs/buttons in selected message |
-| `o` (scrolled) | Open focused URL in browser / activate button |
+| `o` (scrolled) | Open focused URL / activate button |
 | `Esc` | Close image preview (if open), otherwise open/close menu |
 
 ### input editing
@@ -81,6 +88,7 @@ skychat username password    # skip the formalities
 | `Home` / `End` | Jump to start/end |
 | `Backspace` / `Del` | Delete character |
 | `Enter` | Send message |
+| `Alt+Enter` / `Shift+Enter` | New line (multi-line message) |
 
 ### image preview
 
@@ -88,9 +96,8 @@ Hover over an image URL in scroll mode and a preview popup appears automatically
 
 | Key | Action |
 |-----|--------|
-| `H` | Hide popup (suppressed until focus moves to a different URL) |
-| `Esc` | Same as `H` |
-| `O` | Open image in browser |
+| `H` / `Esc` | Hide popup (suppressed until focus moves to a different URL) |
+| `O` | Open image URL with configured URL opener |
 | `<` / `>` | Cycle to prev/next link in the message |
 
 ## slash commands
@@ -111,7 +118,8 @@ Hover over an image URL in scroll mode and a preview popup appears automatically
 |------|--------|
 | Cycle theme | Dracula → Nord → Gruvbox → Solarized Dark → Tokyo Night → Monokai |
 | Toggle notifications | desktop notifications + terminal bell |
-| Image Preview | toggle inline image preview (persisted to config) |
+| Image Preview | toggle inline image preview |
+| Open URLs with | cycle between available URL openers (xdg-open, browsh, w3m) |
 | Pick color | set your username color |
 | Logout | nuke saved token and exit |
 | Quit | exit without clearing token |
@@ -127,6 +135,7 @@ lives at `~/.skychat_tui.json`:
 | `theme` | `Dracula` | active color theme |
 | `notifications` | `true` | desktop notifications |
 | `image_preview` | `true` | inline image preview |
+| `url_opener` | `xdg-open` | URL opener (`xdg-open`, `browsh`, or `w3m`) |
 
 ## requirements
 
@@ -157,4 +166,22 @@ sudo pacman -S libcaca
 
 # macOS
 brew install libcaca
+```
+
+### optional — URL openers
+
+auto-detected at startup, `xdg-open` always available as fallback:
+
+| Opener | Notes |
+|--------|-------|
+| **xdg-open** | default — opens in your configured desktop browser |
+| **browsh** | full graphical browser rendered in the terminal |
+| **w3m** | lightweight terminal browser, good for text-heavy pages |
+
+```bash
+# browsh — see https://www.brow.sh/
+# w3m
+sudo apt install w3m   # Debian/Ubuntu
+sudo pacman -S w3m     # Arch
+brew install w3m       # macOS
 ```
