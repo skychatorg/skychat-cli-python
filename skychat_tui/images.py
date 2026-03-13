@@ -187,6 +187,61 @@ def _detect_protocol() -> Optional[str]:
     return None
 
 
+# ── URL opener detection ──────────────────────────────────────────────────────
+
+_URL_OPENERS_AVAILABLE: Optional[List[str]] = None  # cached after first call
+
+
+def _detect_url_openers() -> List[str]:
+    """Return list of available URL openers in preference order.
+    Always includes 'xdg-open' as the base fallback.
+    Probes for 'browsh' and 'w3m' via shutil.which, same pattern as image protocol detection.
+    """
+    global _URL_OPENERS_AVAILABLE
+    if _URL_OPENERS_AVAILABLE is not None:
+        return _URL_OPENERS_AVAILABLE
+    openers = ['xdg-open']
+    if shutil.which('browsh'):
+        openers.insert(0, 'browsh')
+    if shutil.which('w3m'):
+        # Insert after browsh (if present) but before xdg-open
+        idx = 1 if 'browsh' in openers else 0
+        openers.insert(idx, 'w3m')
+    _dbg.debug('_detect_url_openers: %s', openers)
+    _URL_OPENERS_AVAILABLE = openers
+    return openers
+
+
+def _open_url(url: str, opener: str, stdscr) -> None:
+    """Open *url* with *opener*.
+
+    For terminal browsers (browsh, w3m): suspends curses, runs the browser
+    in the foreground, then reinitialises curses so the TUI can resume cleanly.
+    For xdg-open: fires in the background, no curses disruption needed.
+    """
+    import curses as _curses
+    terminal_browsers = ('browsh', 'w3m')
+    if opener in terminal_browsers:
+        # Hand the terminal over to the browser
+        _curses.endwin()
+        try:
+            subprocess.run([opener, url])
+        except FileNotFoundError:
+            pass  # opener disappeared since detection — fall through silently
+        finally:
+            # Reinitialise curses fully
+            stdscr.refresh()
+            _curses.doupdate()
+    else:
+        # xdg-open / webbrowser — non-blocking, no terminal takeover
+        try:
+            subprocess.Popen(['xdg-open', url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            import webbrowser
+            webbrowser.open(url)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 _UPLOAD_METHOD: Optional[str] = None

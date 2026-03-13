@@ -24,9 +24,22 @@ Username to log in with. If omitted, the login screen is shown.
 Password to log in with. Required if \fIusername\fR is given.
 .TP
 .B \-\-debug
-Write crash tracebacks to
+Write crash tracebacks and debug logs to
 .I /tmp/skychat_crash.log
+and
+.I /tmp/skychat_debug.log
 instead of silently exiting.
+.SH ENVIRONMENT
+.TP
+.B SKYCHAT_URL
+WebSocket server URL to connect to. Defaults to
+.IR wss://skych.at/api/ws .
+Useful for self-hosted instances.
+.TP
+.B ESCDELAY
+ncurses ESC disambiguation delay in milliseconds. Automatically set to
+.B 25
+by the client to reduce latency.
 .SH LAYOUT
 .PP
 The interface is divided into three vertical panels:
@@ -89,7 +102,7 @@ Delete selected message (own messages only).
 Cycle between URLs and buttons in the selected message.
 .TP
 .BR o " (while scrolled)"
-Open focused URL in browser or activate focused button.
+Open focused URL with the configured URL opener, or activate focused button.
 .TP
 .B Esc
 Close image preview if open (then open menu), otherwise toggle menu.
@@ -106,9 +119,10 @@ Delete character.
 .TP
 .B Enter
 Send message.
+.TP
+.BR Alt+Enter " / " Shift+Enter
+Insert a newline (compose multi-line messages).
 .PP
-Multi-line messages can be composed with
-.BR Alt+Enter " or " Shift+Enter .
 The input box grows up to 5 lines and shrinks back after sending.
 Lines beginning with
 .B >
@@ -122,7 +136,7 @@ a preview popup appears automatically after a short hover delay.
 Hide popup (suppressed until focus moves to a different URL). Esc also opens the menu.
 .TP
 .B O
-Open the image URL in the default browser.
+Open the image URL with the configured URL opener.
 .TP
 .BR < " / " >
 Cycle to the previous or next link in the message.
@@ -161,6 +175,12 @@ Enable or disable desktop notifications and terminal bell.
 .B Image Preview
 Toggle inline image preview (persisted to config).
 .TP
+.B Open URLs with
+Cycle through available URL openers: xdg-open, browsh, w3m.
+Only openers found on
+.B PATH
+are offered. The choice is persisted to config.
+.TP
 .B Pick color
 Set your username colour (loaded from server).
 .TP
@@ -190,6 +210,20 @@ Whether desktop notifications are enabled. Default:
 .B image_preview
 Whether inline image preview is enabled. Default:
 .IR true .
+.TP
+.B url_opener
+URL opener used when pressing
+.BR O .
+One of
+.BR xdg-open ,
+.BR browsh ,
+or
+.BR w3m .
+Default:
+.IR xdg-open .
+Only openers present on
+.B PATH
+are selectable via the menu.
 .SH IMAGE PREVIEW
 Image preview is auto-detected at startup and disabled gracefully if none of the
 following are available:
@@ -212,6 +246,23 @@ Requires
 or the
 .B python-caca
 bindings. Coloured ASCII art fallback, works in any 256-colour terminal.
+.SH URL OPENERS
+The URL opener used when pressing
+.B O
+on a link or image is configurable via the menu and persisted across sessions.
+Available openers are auto-detected at startup using
+.BR shutil.which .
+.TP
+.B xdg-open
+Default. Opens the URL in the system-configured desktop browser. Non-blocking.
+.TP
+.B browsh
+Full graphical browser rendered in the terminal. Suspends curses while running;
+the TUI resumes cleanly on exit.
+.TP
+.B w3m
+Lightweight terminal browser. Suspends curses while running;
+the TUI resumes cleanly on exit.
 .SH FILES
 .TP
 .I ~/.skychat_tui.json
@@ -221,12 +272,11 @@ User configuration and saved auth token.
 Crash traceback written when
 .B \-\-debug
 is passed.
-.SH ENVIRONMENT
 .TP
-.B ESCDELAY
-ncurses ESC disambiguation delay in milliseconds. Automatically set to
-.B 25
-by the client to reduce latency.
+.I /tmp/skychat_debug.log
+Verbose debug log written when
+.B \-\-debug
+is passed.
 .SH EXAMPLES
 .TP
 Open the login screen:
@@ -237,6 +287,9 @@ Log in directly:
 .TP
 Log in with crash logging enabled:
 .B skychat alice hunter2 \-\-debug
+.TP
+Connect to a self-hosted instance:
+.B SKYCHAT_URL=wss://chat.example.com/api/ws skychat
 .SH REQUIREMENTS
 Python 3.10 or later.
 The
@@ -248,6 +301,8 @@ Sixel image preview may flicker on large images due to the nature of the Sixel
 protocol interacting with curses repaints. Use Kitty protocol for flicker-free
 image display.
 .SH SEE ALSO
+.BR w3m (1),
+.BR browsh (1),
 .BR curl (1),
 .BR python3 (1)
 .PP

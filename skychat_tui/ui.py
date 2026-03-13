@@ -29,6 +29,7 @@ from .helpers import (
 from .images import (
     ImagePopup, _init_caca_pairs, _is_image_url,
     _detect_protocol, _query_cell_pixels,
+    _detect_url_openers,
     _dbg,
 )
 
@@ -236,6 +237,7 @@ class ChatUI:
         self.menu_cursor:           int        = 0
         self.notifications_enabled: bool       = load_config().get('notifications', True)
         self.image_preview_enabled: bool       = load_config().get('image_preview', True)
+        self.url_opener: str                   = load_config().get('url_opener', 'xdg-open')
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -356,6 +358,7 @@ class ChatUI:
             f"Theme: {_active_theme}",
             f"Notifications: {'ON' if self.notifications_enabled else 'OFF'}",
             f"Image Preview: {'ON' if self.image_preview_enabled else 'OFF'}",
+            f"Open URLs with: {self.url_opener}",
             "Pick username color…" if self.colour_list else "Pick color (not loaded)",
             "Logout",
             "Quit",

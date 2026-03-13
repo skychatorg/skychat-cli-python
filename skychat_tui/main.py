@@ -10,7 +10,6 @@ import subprocess
 import sys
 import time
 import urllib.parse
-import webbrowser
 from typing import Optional
 
 from .constants import DEFAULT_WSS_URL, DEFAULT_ROOM_ID, C_DYN_BASE
@@ -23,7 +22,7 @@ from .images import (
     _enable_debug_logging, _detect_protocol, _query_cell_pixels,
     _wss_to_http, _upload_file_bytes, _upload_local_file,
     _grab_clipboard_image, _is_image_url, _dbg, ImagePopup,
-    _get_upload_method,
+    _get_upload_method, _detect_url_openers, _open_url,
 )
 import skychat_tui.images as _img_mod
 from .ui import (
@@ -338,7 +337,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return False
 
         # Main menu
-        menu_items_count = 6
+        menu_items_count = 7
         if key == curses.KEY_UP:
             ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
         elif key == curses.KEY_DOWN:
@@ -364,19 +363,25 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                         _img_mod._CELL_PX = _query_cell_pixels()
                         _dbg.debug('cell pixels (on enable): %s', _img_mod._CELL_PX)
                 ui.set_status(f'Image Preview {"ON" if ui.image_preview_enabled else "OFF"}', ttl=2.0)
-            elif ui.menu_cursor == 3:  # Pick colour
+            elif ui.menu_cursor == 3:  # Cycle URL opener
+                available = _detect_url_openers()
+                idx = available.index(ui.url_opener) if ui.url_opener in available else 0
+                ui.url_opener = available[(idx + 1) % len(available)]
+                save_config({'url_opener': ui.url_opener})
+                ui.set_status(f'Open URLs with: {ui.url_opener}', ttl=2.0)
+            elif ui.menu_cursor == 4:  # Pick colour
                 if ui.colour_list:
                     ui.colour_pick_open   = True
                     ui.colour_pick_cursor = 0
                 else:
                     ui.set_status('✗  Colour list not yet received', ttl=3.0)
-            elif ui.menu_cursor == 4:  # Logout
+            elif ui.menu_cursor == 5:  # Logout
                 ui.menu_open = False
                 save_config({'token': None, 'username': ''})
                 client._running = False
                 conn_task.cancel()
                 return True
-            elif ui.menu_cursor == 5:  # Quit
+            elif ui.menu_cursor == 6:  # Quit
                 ui.menu_open = False
                 client._running = False
                 conn_task.cancel()
@@ -522,7 +527,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 if _ias:
                     _val, _kind = _ias[ui.btn_cursor % len(_ias)]
                     if _kind == 'url' or _val.startswith('http'):
-                        webbrowser.open(_val)
+                        _open_url(_val, ui.url_opener, stdscr)
                         ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
                     else:
                         asyncio.ensure_future(client.send_message(_val))
@@ -917,6 +922,12 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.cycle_focus(reverse=True)
             if rooms_list: ui.room_cursor = min(ui.room_cursor, len(rooms_list) - 1)
             if users_list: ui.user_cursor = min(ui.user_cursor, len(users_list) - 1)
+            continue
+
+        # O = open popup URL with configured opener
+        if key in ('o', 'O') and image_popup is not None and _hover_url:
+            _open_url(_hover_url, ui.url_opener, stdscr)
+            ui.force_full_redraw()
             continue
 
         # H = hide image popup (stays hidden until focus moves to a different URL)
