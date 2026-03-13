@@ -23,16 +23,29 @@ Usage:
     skychat <username> <password>    # skip prompt
 """
 
+import argparse
 import asyncio
+import base64
+import io
+import mimetypes
+import os
+import os.path
+import random
+import re
+import shutil
+import ssl
+import struct
 import subprocess
 import curses
 import json
-import os
-import re
-import struct
 import sys
+import tempfile
 import time
 import unicodedata
+import urllib.parse
+import urllib.request
+import urllib.error
+import uuid
 import webbrowser
 from datetime import datetime
 from enum import Enum, auto
@@ -236,8 +249,7 @@ def _cols_aware_wrap(text: str, width: int) -> List[str]:
         return [""]
 
     # Split into tokens preserving spaces: alternate between word and space runs
-    import re as _re2
-    tokens = _re2.split(r'(\s+)', text)
+    tokens = re.split(r'(\s+)', text)
 
     lines: List[str] = []
     current      = ""
@@ -350,8 +362,7 @@ def _query_cell_pixels() -> Tuple[int, int]:
         if ready:
             resp = os.read(fd, 32)
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        import re as _re
-        m = _re.search(rb'\033\[6;(\d+);(\d+)t', resp)
+        m = re.search(rb'\033\[6;(\d+);(\d+)t', resp)
         if m:
             cw, ch = int(m.group(2)), int(m.group(1))
             _dbg.debug('_query_cell_pixels: raw=%r -> w=%d h=%d', resp, cw, ch)
@@ -378,8 +389,7 @@ def _probe_sixel() -> bool:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         _dbg.debug('_probe_sixel: DA1 raw=%r', resp)
         # Response: ESC [ ? <attrs> c  — attrs are semicolon-separated numbers
-        import re as _re
-        m = _re.search(rb'\033\[\?([0-9;]+)c', resp)
+        m = re.search(rb'\033\[\?([0-9;]+)c', resp)
         if m:
             attrs = m.group(1).split(b';')
             return b'4' in attrs
@@ -390,7 +400,7 @@ def _probe_sixel() -> bool:
 
 def _probe_kitty() -> bool:
     """Send a 1×1 dummy Kitty graphics command and check for an OK response."""
-    import select, termios, tty, base64
+    import select, termios, tty
     try:
         fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
@@ -419,8 +429,7 @@ IMAGE_EXTS = frozenset({
 })
 
 def _is_image_url(url: str) -> bool:
-    from urllib.parse import urlparse
-    return any(urlparse(url).path.lower().endswith(e) for e in IMAGE_EXTS)
+    return any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in IMAGE_EXTS)
 
 
 def _detect_protocol() -> Optional[str]:
@@ -460,8 +469,7 @@ def _detect_protocol() -> Optional[str]:
             return 'kitty'
 
     # --- Caca fallback: works in any colour terminal, no pixel protocol needed ---
-    import shutil as _shutil
-    _img2txt_available = bool(_shutil.which('img2txt'))
+    _img2txt_available = bool(shutil.which('img2txt'))
     if _CACA_OK or _img2txt_available:
         _dbg.debug('_detect_protocol: caca fallback (bindings=%s img2txt=%s)',
                    _CACA_OK, _img2txt_available)
@@ -473,9 +481,15 @@ def _detect_protocol() -> Optional[str]:
 
 
 import logging as _logging
-_logging.basicConfig(filename='/tmp/skychat_img_debug.log', level=_logging.DEBUG,
-                     format='%(asctime)s %(message)s')
-_dbg = _logging.getLogger('img')
+_dbg = _logging.getLogger('skychat')
+_dbg.addHandler(_logging.NullHandler())  # silent by default; --debug activates file logging
+
+def _enable_debug_logging() -> None:
+    """Activate file logging to /tmp/skychat_debug.log. Called when --debug is passed."""
+    handler = _logging.FileHandler('/tmp/skychat_debug.log')
+    handler.setFormatter(_logging.Formatter('%(asctime)s %(name)s %(message)s'))
+    _dbg.addHandler(handler)
+    _dbg.setLevel(_logging.DEBUG)
 
 
 # ── Upload capability detection ────────────────────────────────────────────
@@ -490,7 +504,6 @@ def _detect_upload() -> Optional[str]:
         pass
     # aiohttp not available — still support file:// / path paste via stdlib
     # but check for clipboard image tools
-    import shutil
     if shutil.which('xclip'):
         return 'xclip'
     if shutil.which('wl-paste'):
@@ -521,7 +534,6 @@ async def _upload_file_bytes(data: bytes, filename: str, base_url: str,
     - As a 'token' field in the multipart form body
     - As an Authorization header (Bearer)
     """
-    import uuid
     token_json = json.dumps(token) if token else None
 
     endpoint = base_url.rstrip('/') + '/api/upload'
@@ -541,8 +553,7 @@ async def _upload_file_bytes(data: bytes, filename: str, base_url: str,
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             form = aiohttp.FormData()
-            import mimetypes as _mt
-            mime = _mt.guess_type(filename)[0] or 'image/png'
+            mime = mimetypes.guess_type(filename)[0] or 'image/png'
             form.add_field('file', data, filename=filename,
                            content_type=mime)
             async with session.post(endpoint, data=form, headers=browser_headers,
@@ -553,22 +564,20 @@ async def _upload_file_bytes(data: bytes, filename: str, base_url: str,
                 result = await resp.json(content_type=None)
     else:
         # ── stdlib urllib multipart path ──────────────────────────────
-        import urllib.request, urllib.error
         boundary = uuid.uuid4().hex
         parts = (
             f'--{boundary}\r\n'
             f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f'Content-Type: {__import__("mimetypes").guess_type(filename)[0] or "image/png"}\r\n\r\n'
+            f'Content-Type: {mimetypes.guess_type(filename)[0] or "image/png"}\r\n\r\n'
         ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
         headers = {
             'Content-Type': f'multipart/form-data; boundary={boundary}',
             **browser_headers,
         }
         req = urllib.request.Request(endpoint, data=parts, headers=headers, method='POST')
-        import ssl as _ssl
-        ctx = _ssl.create_default_context()
+        ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
+        ctx.verify_mode = ssl.CERT_NONE
         loop = asyncio.get_running_loop()
         def _do_req():
             try:
@@ -587,7 +596,6 @@ async def _upload_file_bytes(data: bytes, filename: str, base_url: str,
 async def _upload_local_file(path: str, base_url: str,
                               token: Optional[dict] = None) -> str:
     """Read a local file and upload it."""
-    import os.path, mimetypes
     path = path.strip()
     if not os.path.isfile(path):
         raise RuntimeError(f'File not found: {path}')
@@ -808,8 +816,7 @@ def _parse_ansi_to_spans(raw: bytes, cols: int, rows: int
     Handles both basic (30-37/40-47) and 256-colour (38;5;N / 48;5;N) SGR codes.
     Colours are approximated to the 11 pre-baked caca pairs (21-31).
     """
-    import re as _re
-    tok_re  = _re.compile(rb'\033\[([0-9;]*)m|([^\033\n]+)|\n')
+    tok_re  = re.compile(rb'\033\[([0-9;]*)m|([^\033\n]+)|\n')
     ansi8   = [curses.COLOR_BLACK, curses.COLOR_RED,     curses.COLOR_GREEN,
                curses.COLOR_YELLOW, curses.COLOR_BLUE,   curses.COLOR_MAGENTA,
                curses.COLOR_CYAN,   curses.COLOR_WHITE]
@@ -895,8 +902,6 @@ def _parse_ansi_to_spans(raw: bytes, cols: int, rows: int
 def _render_caca(img_path: str, cols: int, rows: int) -> 'List[List[Tuple[str,int]]]':
     """Render image to coloured curses spans via img2txt or caca bindings.
     Returns List[rows] of List[(text, curses_attr)] spans."""
-    import subprocess, shutil
-
     img2txt = shutil.which('img2txt')
     if img2txt:
         try:
@@ -934,7 +939,6 @@ def _render_caca(img_path: str, cols: int, rows: int) -> 'List[List[Tuple[str,in
 def _kitty_place(img_rgb: bytes, px_w: int, px_h: int,
                  cell_x: int, cell_y: int) -> None:
     """Send raw RGB pixels as a Kitty graphics command (f=24, a=T, q=2)."""
-    import base64
     _dbg.debug('_kitty_place %dx%d cell=(%d,%d) bytes=%d',
                px_w, px_h, cell_x, cell_y, len(img_rgb))
     buf  = bytearray()
@@ -1039,7 +1043,6 @@ class ImagePopup:
             self._dirty = True
 
     def _fetch_scale_encode(self, cw: int, ch: int):
-        import urllib.request, urllib.error, io as _io, tempfile, os as _os
         req = urllib.request.Request(
             self.url, headers={'User-Agent': 'skychat-tui/1.0'})
         try:
@@ -1055,8 +1058,7 @@ class ImagePopup:
             # Write raw bytes to a temp file so img2txt / caca can read it
             suffix = '.png'
             try:
-                from urllib.parse import urlparse as _up
-                suffix = _os.path.splitext(_up(self.url).path)[1] or '.png'
+                suffix = os.path.splitext(urllib.parse.urlparse(self.url).path)[1] or '.png'
             except Exception:
                 pass
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
@@ -1066,7 +1068,7 @@ class ImagePopup:
                 lines = _render_caca(tmp_path, inner_cw, inner_ch)
             finally:
                 try:
-                    _os.unlink(tmp_path)
+                    os.unlink(tmp_path)
                 except Exception:
                     pass
             _dbg.debug('caca rendered %d lines x %d cols', len(lines), inner_cw)
@@ -1075,7 +1077,7 @@ class ImagePopup:
 
         # ── pixel protocols: decode + scale with Pillow ─────────────
         try:
-            img = _PILImage.open(_io.BytesIO(raw))
+            img = _PILImage.open(io.BytesIO(raw))
             img.load()
         except Exception as e:
             raise RuntimeError(f'Cannot decode: {e}')
@@ -1235,6 +1237,62 @@ class ImagePopup:
             self._win = None
 
 
+def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
+    """Apply a jsondiffpatch array delta (with _t:'a') to a list.
+
+    jsondiffpatch array delta keys:
+      "_N" with [val, 0, 0]   -> delete item originally at index N
+      "_N" with [old, new, 3] -> item moved from index N to new index
+      "N"  with [val]         -> insert val at index N in the result
+      "N"  with {...}         -> nested object delta at index N
+    """
+    if not isinstance(delta, dict) or delta.get('_t') != 'a':
+        return lst
+
+    to_delete = {}   # orig_index -> None (deleted) or ('move', dest)
+    to_insert = {}   # result_index -> value
+    to_modify = {}   # orig_index -> sub-delta
+
+    for key, val in delta.items():
+        if key == '_t':
+            continue
+        if key.startswith('_'):
+            orig_idx = int(key[1:])
+            if isinstance(val, list) and len(val) == 3 and val[1] == 0 and val[2] == 0:
+                to_delete[orig_idx] = None  # deleted
+            elif isinstance(val, list) and len(val) == 3 and val[2] == 3:
+                to_delete[orig_idx] = ('move', val[1])  # moved to result index val[1]
+                to_insert[val[1]] = lst[orig_idx] if orig_idx < len(lst) else val[0]
+        else:
+            result_idx = int(key)
+            if isinstance(val, list) and len(val) == 1:
+                to_insert[result_idx] = val[0]  # added
+            elif isinstance(val, dict):
+                to_modify[result_idx] = val
+
+    new_lst = []
+    for i, item in enumerate(lst):
+        if i in to_delete:
+            continue  # skip deleted (moves are re-inserted below)
+        if i in to_modify:
+            sub = to_modify[i]
+            if isinstance(item, dict) and isinstance(sub, dict):
+                item = dict(item)
+                for fk, fv in sub.items():
+                    if isinstance(fv, list) and len(fv) == 2:
+                        item[fk] = fv[1]  # [old, new] -> take new
+                    elif isinstance(fv, list) and len(fv) == 1:
+                        item[fk] = fv[0]  # [added]
+                    elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
+                        item.pop(fk, None)  # deleted field
+        new_lst.append(item)
+
+    for ins_idx in sorted(to_insert.keys()):
+        new_lst.insert(ins_idx, to_insert[ins_idx])
+
+    return new_lst
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SkyChatClient — WebSocket layer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1288,67 +1346,6 @@ class SkyChatClient:
             self._connected_list[:] = s  # mutate in-place so existing references stay valid
             self._connected_list_dirty = True
         self.on("connected-list", _on_connected_list)
-
-        def _apply_jsondiffpatch_array(lst, delta):
-            """Apply a jsondiffpatch array delta (with _t:'a') to a list in-place.
-
-            jsondiffpatch array delta keys:
-              "_N" with [val, 0, 0]  -> delete item originally at index N
-              "_N" with [old, new, 3] -> item moved from index N to new index
-              "N"  with [val]         -> insert val at index N in the result
-              "N"  with {...}         -> nested object delta at index N
-            """
-            if not isinstance(delta, dict) or delta.get('_t') != 'a':
-                return lst
-
-            # Collect deletions/moves (keys starting with '_')
-            # and insertions/modifications (numeric keys)
-            to_delete = {}   # orig_index -> entry (or move destination)
-            to_insert = {}   # result_index -> value
-            to_modify = {}   # orig_index -> sub-delta
-
-            for key, val in delta.items():
-                if key == '_t':
-                    continue
-                if key.startswith('_'):
-                    orig_idx = int(key[1:])
-                    if isinstance(val, list) and len(val) == 3 and val[1] == 0 and val[2] == 0:
-                        to_delete[orig_idx] = None  # deleted
-                    elif isinstance(val, list) and len(val) == 3 and val[2] == 3:
-                        to_delete[orig_idx] = ('move', val[1])  # moved to result index val[1]
-                        to_insert[val[1]] = lst[orig_idx] if orig_idx < len(lst) else val[0]
-                else:
-                    result_idx = int(key)
-                    if isinstance(val, list) and len(val) == 1:
-                        to_insert[result_idx] = val[0]  # added
-                    elif isinstance(val, dict):
-                        # Find original index: result_idx adjusted for prior deletions
-                        to_modify[result_idx] = val
-
-            # Build new list: start from original, remove deleted, apply modifications
-            new_lst = []
-            for i, item in enumerate(lst):
-                if i in to_delete:
-                    continue  # skip deleted (moves are re-inserted below)
-                if i in to_modify:
-                    sub = to_modify[i]
-                    # Apply simple field-level delta (non-array object diff)
-                    if isinstance(item, dict) and isinstance(sub, dict):
-                        item = dict(item)
-                        for fk, fv in sub.items():
-                            if isinstance(fv, list) and len(fv) == 2:
-                                item[fk] = fv[1]  # [old, new] -> take new
-                            elif isinstance(fv, list) and len(fv) == 1:
-                                item[fk] = fv[0]  # [added]
-                            elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
-                                item.pop(fk, None)  # deleted field
-                new_lst.append(item)
-
-            # Insert new/moved items at their result positions
-            for ins_idx in sorted(to_insert.keys()):
-                new_lst.insert(ins_idx, to_insert[ins_idx])
-
-            return new_lst
 
         def _on_connected_list_patch(patch):
             """Apply a jsondiffpatch delta to the connected list."""
@@ -1525,7 +1522,6 @@ class SkyChatClient:
         await self._reconnect()
 
     async def _reconnect(self, immediate: bool = False) -> None:
-        import random
         self._is_reconnecting = True
         if immediate:
             self._reconnect_attempts = 0
@@ -2062,6 +2058,22 @@ def ncurses_login(stdscr, prefill_username: str = '',
             pass
 
 
+def _room_display_name(room: Dict, own_username: str = "") -> str:
+    """Return a human-readable name for a room.
+
+    For private/DM rooms with no server-provided name, falls back to the
+    whitelist members excluding the current user, or the room id.
+    """
+    name = room.get("name", "") or ""
+    if not name and room.get("isPrivate"):
+        wl    = room.get("whitelist") or room.get("allowedUsers") or []
+        own_l = own_username.lower()
+        parts = [u.get("username", "") if isinstance(u, dict) else str(u) for u in wl]
+        parts = [p for p in parts if p and p.lower() != own_l]
+        name  = ", ".join(parts) or str(room.get("id", "?"))
+    return name or str(room.get("id", "?"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ChatUI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2136,8 +2148,9 @@ class ChatUI:
         self._last_skip_top:      int            = 0   # lines clipped from topmost msg
 
         # History lazy-loading
-        self.history_exhausted:  bool             = False
-        self.history_fetching:   bool             = False
+        self.history_exhausted:   bool             = False
+        self.history_fetching:    bool             = False
+        self._history_empty_count: int             = 0
         self._history_fetch_cb:  Optional[Callable] = None
 
         # Escape menu
@@ -2393,13 +2406,7 @@ class ChatUI:
         _, W  = w.getmaxyx()
         room  = next((r for r in rooms if r.get("id") == room_id), None)
         if room:
-            rname_raw = room.get("name", "") or ""
-            if not rname_raw and room.get("isPrivate"):
-                wl = room.get("whitelist") or room.get("allowedUsers") or []
-                own_l = username.lower()
-                parts = [u.get("username", "") if isinstance(u, dict) else str(u) for u in wl]
-                parts = [p for p in parts if p and p.lower() != own_l]
-                rname_raw = ", ".join(parts) or str(room.get("id", "?"))
+            rname_raw = _room_display_name(room, username)
             rname = f"@ {rname_raw}" if room.get("isPrivate") else f"# {rname_raw}"
         else:
             rname = "~ SkyChat"
@@ -2454,15 +2461,7 @@ class ChatUI:
                 rid_int = int(rid_val)
             except (ValueError, TypeError):
                 rid_int = rid_val
-            name      = room.get("name", "") or ""
-            if not name and room.get("isPrivate"):
-                wl = room.get("whitelist") or room.get("allowedUsers") or []
-                own_l = own_username.lower()
-                parts = [u.get("username", "") if isinstance(u, dict) else str(u) for u in wl]
-                parts = [p for p in parts if p and p.lower() != own_l]
-                name = ", ".join(parts) or str(rid_val if rid_val is not None else "?")
-            elif not name:
-                name = str(rid_val if rid_val is not None else "?")
+            name = _room_display_name(room, own_username)
             count     = room_counts.get(rid_int, 0)
             is_cur    = focused and i == self.room_cursor
             is_join   = rid_int == current_room_id
@@ -3116,9 +3115,13 @@ class ChatUI:
         """Allocate a colour pair for a fixed xterm-256 index (no init_color)."""
         if xterm_idx in self._colour_pair_cache:
             return self._colour_pair_cache[xterm_idx]
-        pair = self._next_pair
-        if pair > 255:
+        pair     = self._next_pair
+        max_pair = curses.COLOR_PAIRS - 1
+        if pair > max_pair:
+            _dbg.warning('colour pair pool exhausted (COLOR_PAIRS=%d); falling back to C_USERNAME', curses.COLOR_PAIRS)
             return C_USERNAME
+        if pair > max_pair - 8:
+            _dbg.warning('colour pair pool nearly full (%d/%d used)', pair - C_DYN_BASE, max_pair - C_DYN_BASE)
         try:
             curses.init_pair(pair, xterm_idx, -1)
             self._colour_pair_cache[xterm_idx] = pair
@@ -3170,29 +3173,9 @@ class ChatUI:
         self._history_empty_count = 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main TUI loop
-# ─────────────────────────────────────────────────────────────────────────────
 
-async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
-                   guest: bool, saved_token: Optional[dict] = None) -> None:
-    curses.curs_set(1)
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
-    try:
-        curses.set_escdelay(25)  # Python 3.9+; silently ignored if unavailable
-    except AttributeError:
-        pass
-
-    # Enable bracketed paste mode: terminal wraps pastes in \x1b[200~ ... \x1b[201~
-    # so we receive the whole paste at once instead of char-by-char.
-    sys.stdout.write('\x1b[?2004h')
-    sys.stdout.flush()
-
-    ui     = ChatUI(stdscr)
-    client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
-
-    # ── Event wiring ──────────────────────────────────────────────────
+def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
+    """Register all client event handlers that bridge the WebSocket layer to the UI."""
 
     @client.on("custom")
     def _on_custom(data):
@@ -3201,19 +3184,14 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             if isinstance(colours, list):
                 ui.colour_list = colours
 
-
-
     def _notify(title: str, body: str) -> None:
         """Fire a desktop + terminal-bell notification if enabled."""
         if not ui.notifications_enabled:
             return
-        # Terminal bell via curses (stdout is owned by curses)
         try:
             curses.beep()
         except Exception:
             pass
-        # Desktop notification via notify-send
-        # Inject DBUS address so it works inside tmux/plain terminals
         try:
             env = os.environ.copy()
             if "DBUS_SESSION_BUS_ADDRESS" not in env:
@@ -3236,30 +3214,24 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     @client.on("message")
     def _on_msg(msg):
         ui.add_message(msg)
-        # Notifications
         own = client.current_user.get("username", "")
         sender_obj = msg.get("user", {})
         sender = sender_obj.get("username", "") if isinstance(sender_obj, dict) else str(sender_obj)
         content = _strip_tags(msg.get("content") or msg.get("formatted") or "")
-        # Normalise room_id to int for reliable comparison
         raw_rid = msg.get("room") if msg.get("room") is not None else msg.get("roomId")
         try:
             room_id = int(raw_rid) if raw_rid is not None else None
         except (TypeError, ValueError):
             room_id = None
-        # Don't notify for own messages
         if sender == own:
             return
-        # Find the room
-        room = next((r for r in client.rooms if r.get("id") == room_id), None)
+        room  = next((r for r in client.rooms if r.get("id") == room_id), None)
         is_dm = room.get("isPrivate", False) if room else False
-        # Mentions always fire regardless of which room is open
         mentioned = bool(own) and f'@{own}' in content
         if mentioned:
             _notify(f'@{own} — {sender}', content[:120])
         elif is_dm and room_id != client.current_room_id:
             _notify(f'DM from {sender}', content[:120])
-        # Unread indicator — skip if this is the currently viewed room
         if room_id is not None and room_id != client.current_room_id:
             if mentioned or ui.unread.get(room_id) != 'mention':
                 ui.unread[room_id] = 'mention' if mentioned else 'unread'
@@ -3289,41 +3261,26 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             entry = ChatUI._msg_to_entry(m, storage=m.get("storage"))
             if entry:
                 prepend.append(entry)
-        # Release fetching lock
         ui.history_fetching = False
         if prepend:
-            n = len(prepend)
             was_empty = len(ui.messages) == 0
-
-            # Save the ID of the message currently at the bottom of the viewport
-            # so we can reanchor after prepend without any index arithmetic.
             anchor_id = None
             if not was_empty and ui.scroll_offset > 0:
                 newest_idx = max(0, len(ui.messages) - 1 - ui.scroll_offset)
                 anchor_msg = ui.messages[newest_idx] if 0 <= newest_idx < len(ui.messages) else None
-                anchor_id = anchor_msg.get('id') if anchor_msg else None
-
+                anchor_id  = anchor_msg.get('id') if anchor_msg else None
             ui.messages = prepend + ui.messages
-
             if anchor_id:
-                # Find the anchor message in the new list and recompute scroll_offset
-                # so newest_idx points at the same message as before.
                 for new_idx, m in enumerate(ui.messages):
                     if m.get('id') == anchor_id:
                         ui.scroll_offset = max(0, len(ui.messages) - 1 - new_idx)
                         break
-                # Recompute _last_msg_range from the new scroll_offset so KEY_UP
-                # doesn't use stale indices. newest is the anchor, oldest unknown
-                # until next draw — set to 0 as a safe lower bound.
                 new_newest = max(0, len(ui.messages) - 1 - ui.scroll_offset)
                 ui._last_msg_range = (0, new_newest)
-                ui._last_skip_top = 0
-
+                ui._last_skip_top  = 0
             ui.set_status(f"↑ {len(ui.messages)} messages loaded", ttl=2.0)
         else:
-            # Server returned nothing new — either truly exhausted or same batch
-            # Increment counter; after 2 empty responses in a row, give up
-            ui._history_empty_count = getattr(ui, '_history_empty_count', 0) + 1
+            ui._history_empty_count += 1
             if ui._history_empty_count >= 2:
                 ui.history_exhausted = True
                 ui.set_status("↑ No more history", ttl=3.0)
@@ -3354,18 +3311,16 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     @client.on("reconnected")
     def _on_reced(_): ui.set_status("Reconnected ✓", ttl=4.0)
 
-
     async def _fetch_more_history():
         """Fetch older messages. Tries /messagehistory <oldest_id> first."""
         if not ui.messages:
             await client.send_message("/messagehistory")
             return
-        # Find the message with the smallest id (oldest) that has one
         msgs_with_id = [m for m in ui.messages if m.get("id")]
         if not msgs_with_id:
             await client.send_message("/messagehistory")
             return
-        oldest = min(msgs_with_id, key=lambda m: m["id"])
+        oldest    = min(msgs_with_id, key=lambda m: m["id"])
         oldest_id = oldest["id"]
         await client.send_message(f"/messagehistory {oldest_id}")
 
@@ -3375,23 +3330,29 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     def _on_join(rid):
         room = next((r for r in client.rooms if r.get("id") == rid), None)
         name = room.get("name", rid) if room else rid
-        # Immediately mark room as read locally so the dot clears without
-        # waiting for the server to echo back an updated set-user / lastseen.
         if rid is not None and room:
             last_id = room.get("lastReceivedMessageId") or 0
             if last_id:
                 client.update_lastseen(rid, last_id)
         ui.messages.clear()
-        ui.scroll_offset = 0
-        ui.scroll_cursor = -1
+        ui.scroll_offset   = 0
+        ui.scroll_cursor   = -1
         ui._last_msg_range = (0, 0)
         ui.reset_history_state()
         ui.set_status(f"# {name}", ttl=3.0)
         asyncio.ensure_future(client.send_message("/messagehistory"))
 
-    # ── Connect & auth ────────────────────────────────────────────────
 
-    # For token resume: set up the future BEFORE connecting so we can't miss set-user
+async def _connect_and_auth(
+    client: "SkyChatClient", ui: "ChatUI", stdscr,
+    username: Optional[str], password: Optional[str],
+    guest: bool, saved_token: Optional[dict],
+) -> Optional[asyncio.Task]:
+    """Connect to the server, authenticate, and join the default room.
+
+    Returns the connection Task on success, or None if auth failed
+    (in which case the client is already shut down and the UI has shown an error).
+    """
     _resume_fut: Optional[asyncio.Future] = None
     if saved_token and username is None and not guest:
         client._token = saved_token
@@ -3434,15 +3395,48 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         stdscr.get_wch()
         client._running = False
         conn_task.cancel()
-        return
+        return None
 
     await asyncio.sleep(0.3)
-
     await client.join(DEFAULT_ROOM_ID)
     for i, r in enumerate(client.rooms):
         if r.get("id") == DEFAULT_ROOM_ID:
             ui.room_cursor = i
             break
+
+    return conn_task
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main TUI loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
+                   guest: bool, saved_token: Optional[dict] = None) -> None:
+    curses.curs_set(1)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+    try:
+        curses.set_escdelay(25)  # Python 3.9+; silently ignored if unavailable
+    except AttributeError:
+        pass
+
+    # Enable bracketed paste mode: terminal wraps pastes in \x1b[200~ ... \x1b[201~
+    # so we receive the whole paste at once instead of char-by-char.
+    sys.stdout.write('\x1b[?2004h')
+    sys.stdout.flush()
+
+    ui     = ChatUI(stdscr)
+    client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
+
+    # ── Event wiring ──────────────────────────────────────────────────
+    _wire_events(client, ui)
+
+    # ── Connect & auth ────────────────────────────────────────────────
+    conn_task = await _connect_and_auth(
+        client, ui, stdscr, username, password, guest, saved_token)
+    if conn_task is None:
+        return  # auth failed, already cleaned up
 
     # ── Key handlers ─────────────────────────────────────────────────
 
@@ -3532,8 +3526,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 return True
         return False
 
-    async def _handle_rooms_key(key) -> None:
-        """Handle a keypress while the ROOMS sidebar is focused."""
+    async def _handle_rooms_key(key) -> bool:
+        """Handle a keypress while the ROOMS sidebar is focused. Always returns False."""
         if key == curses.KEY_UP:
             ui.sidebar_move(-1, len(rooms_list))
         elif key == curses.KEY_DOWN:
@@ -3563,9 +3557,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status(f"Left {room.get('name', room['id'])}", ttl=3.0)
                 else:
                     ui.set_status("✗  Can't leave public rooms", ttl=2.0)
+        return False
 
-    async def _handle_users_key(key) -> None:
-        """Handle a keypress while the USERS sidebar is focused."""
+    async def _handle_users_key(key) -> bool:
+        """Handle a keypress while the USERS sidebar is focused. Always returns False."""
         ordered = ui._ordered_users
         if key == curses.KEY_UP:
             ui.sidebar_move(-1, len(ordered))
@@ -3583,6 +3578,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status(f"Opening DM with {target}…", ttl=5.0)
                     asyncio.ensure_future(client.open_dm(target))
                 ui.focus = Focus.INPUT
+        return False
 
     async def _handle_input_key(key) -> bool:
         """Handle a keypress while the INPUT box is focused. Returns True to exit the loop."""
@@ -3769,8 +3765,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             elif local_path.startswith('//'):
                 # file:///path or file://host/path
                 local_path = '/' + local_path.lstrip('/')
-            import urllib.parse as _up
-            local_path = _up.unquote(local_path)
+            local_path = urllib.parse.unquote(local_path)
             ui.set_status(f'⬆ Uploading {os.path.basename(local_path)}…', ttl=30)
             try:
                 url = await _upload_local_file(local_path, _upload_base_url, client.token)
@@ -3785,8 +3780,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return
 
         # ── Detect bare local file path ────────────────────────────────
-        import os.path as _osp
-        if stripped and _osp.isabs(stripped) and _osp.isfile(stripped):
+        if stripped and os.path.isabs(stripped) and os.path.isfile(stripped):
             ui.set_status(f'⬆ Uploading {os.path.basename(stripped)}…', ttl=30)
             try:
                 url = await _upload_local_file(stripped, _upload_base_url, client.token)
@@ -4081,9 +4075,11 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             continue
 
         if ui.focus == Focus.ROOMS:
-            await _handle_rooms_key(key)
+            if await _handle_rooms_key(key):
+                break
         elif ui.focus == Focus.USERS:
-            await _handle_users_key(key)
+            if await _handle_users_key(key):
+                break
         elif await _handle_input_key(key):
             break
 
@@ -4137,7 +4133,6 @@ def _run(stdscr, cli_username: Optional[str], cli_password: Optional[str]) -> No
 
 
 def main() -> None:
-    import argparse
     parser = argparse.ArgumentParser(
         description=f"SkyChat TUI  [{DEFAULT_WSS_URL}]",
         epilog="Tab=focus  ↑↓=navigate  Enter=join/DM  /quit=exit",
@@ -4147,6 +4142,8 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true",
                         help="Write crash tracebacks to /tmp/skychat_crash.log")
     args = parser.parse_args()
+    if args.debug:
+        _enable_debug_logging()
     # Reduce ncurses ESC disambiguation delay from the default ~1 s to 25 ms.
     # Must be set before curses.wrapper() initialises the terminal.
     os.environ.setdefault("ESCDELAY", "25")
