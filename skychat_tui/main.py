@@ -74,6 +74,8 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
         own = client.current_user.get("username", "")
         sender_obj = msg.get("user", {})
         sender = sender_obj.get("username", "") if isinstance(sender_obj, dict) else str(sender_obj)
+        if ui.blacklist and sender.lower() in ui.blacklist:
+            return
         content = _strip_tags(msg.get("content") or msg.get("formatted") or "")
         raw_rid = msg.get("room") if msg.get("room") is not None else msg.get("roomId")
         try:
@@ -115,6 +117,11 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
             mid = m.get("id", 0)
             if mid and mid in existing_ids:
                 continue
+            if ui.blacklist:
+                s = m.get('user', {})
+                s = s.get('username', '') if isinstance(s, dict) else str(s)
+                if s.lower() in ui.blacklist:
+                    continue
             entry = ChatUI._msg_to_entry(m, storage=m.get("storage"))
             if entry:
                 prepend.append(entry)

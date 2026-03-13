@@ -238,6 +238,8 @@ class ChatUI:
         self.notifications_enabled: bool       = load_config().get('notifications', True)
         self.image_preview_enabled: bool       = load_config().get('image_preview', True)
         self.url_opener: str                   = load_config().get('url_opener', 'xdg-open')
+        _bl = load_config().get('blacklist', [])
+        self.blacklist: set = {u.lower() for u in _bl if isinstance(u, str)}
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -331,6 +333,11 @@ class ChatUI:
         }
 
     def add_message(self, msg: Dict) -> None:
+        if self.blacklist:
+            sender = msg.get('user', {})
+            uname = sender.get('username', '') if isinstance(sender, dict) else str(sender)
+            if uname.lower() in self.blacklist:
+                return
         entry = self._msg_to_entry(msg)
         if entry:
             self.messages.append(entry)
@@ -444,7 +451,8 @@ class ChatUI:
                  unread_checker: Optional[Callable] = None) -> None:
         self._own_user = own_user
         if typing_list is not None:
-            self.typing_list = typing_list
+            self.typing_list = [u for u in typing_list
+                                if not self.blacklist or u.lower() not in self.blacklist]
         try:
             self._draw_header(rooms, current_room_id, own_username)
             self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker, own_username=own_username)
@@ -926,6 +934,9 @@ class ChatUI:
         # Split into in-room and out-of-room, in-room first
         in_room, out_room = [], []
         for session in connected_list:
+            uname = session.get('user', {}).get('username', '') or ''
+            if self.blacklist and uname.lower() in self.blacklist:
+                continue
             rooms = session.get("rooms") or []
             try:
                 in_cur = current_room_id is not None and current_room_id in [int(r) for r in rooms]
