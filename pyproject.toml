@@ -21,3 +21,6 @@ skychat = "skychat_tui.client:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["skychat_tui*"]
+
+[tool.setuptools.data-files]
+"share/man/man1" = ["man/skychat.1"]

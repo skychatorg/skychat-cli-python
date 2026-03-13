@@ -1285,21 +1285,77 @@ class SkyChatClient:
             self._scroll_ack_since     = 0.0
         self.on("join-room", _on_join_room)
         def _on_connected_list(s):
-            self._connected_list = s
+            self._connected_list[:] = s  # mutate in-place so existing references stay valid
             self._connected_list_dirty = True
         self.on("connected-list", _on_connected_list)
 
-        def _on_connected_list_patch(patch):
-            """Merge patch entries into the connected list by identifier."""
-            if not isinstance(patch, list):
-                return
-            by_id = {s.get('identifier'): i for i, s in enumerate(self._connected_list)}
-            for entry in patch:
-                ident = entry.get('identifier')
-                if ident in by_id:
-                    self._connected_list[by_id[ident]] = entry
+        def _apply_jsondiffpatch_array(lst, delta):
+            """Apply a jsondiffpatch array delta (with _t:'a') to a list in-place.
+
+            jsondiffpatch array delta keys:
+              "_N" with [val, 0, 0]  -> delete item originally at index N
+              "_N" with [old, new, 3] -> item moved from index N to new index
+              "N"  with [val]         -> insert val at index N in the result
+              "N"  with {...}         -> nested object delta at index N
+            """
+            if not isinstance(delta, dict) or delta.get('_t') != 'a':
+                return lst
+
+            # Collect deletions/moves (keys starting with '_')
+            # and insertions/modifications (numeric keys)
+            to_delete = {}   # orig_index -> entry (or move destination)
+            to_insert = {}   # result_index -> value
+            to_modify = {}   # orig_index -> sub-delta
+
+            for key, val in delta.items():
+                if key == '_t':
+                    continue
+                if key.startswith('_'):
+                    orig_idx = int(key[1:])
+                    if isinstance(val, list) and len(val) == 3 and val[1] == 0 and val[2] == 0:
+                        to_delete[orig_idx] = None  # deleted
+                    elif isinstance(val, list) and len(val) == 3 and val[2] == 3:
+                        to_delete[orig_idx] = ('move', val[1])  # moved to result index val[1]
+                        to_insert[val[1]] = lst[orig_idx] if orig_idx < len(lst) else val[0]
                 else:
-                    self._connected_list.append(entry)
+                    result_idx = int(key)
+                    if isinstance(val, list) and len(val) == 1:
+                        to_insert[result_idx] = val[0]  # added
+                    elif isinstance(val, dict):
+                        # Find original index: result_idx adjusted for prior deletions
+                        to_modify[result_idx] = val
+
+            # Build new list: start from original, remove deleted, apply modifications
+            new_lst = []
+            for i, item in enumerate(lst):
+                if i in to_delete:
+                    continue  # skip deleted (moves are re-inserted below)
+                if i in to_modify:
+                    sub = to_modify[i]
+                    # Apply simple field-level delta (non-array object diff)
+                    if isinstance(item, dict) and isinstance(sub, dict):
+                        item = dict(item)
+                        for fk, fv in sub.items():
+                            if isinstance(fv, list) and len(fv) == 2:
+                                item[fk] = fv[1]  # [old, new] -> take new
+                            elif isinstance(fv, list) and len(fv) == 1:
+                                item[fk] = fv[0]  # [added]
+                            elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
+                                item.pop(fk, None)  # deleted field
+                new_lst.append(item)
+
+            # Insert new/moved items at their result positions
+            for ins_idx in sorted(to_insert.keys()):
+                new_lst.insert(ins_idx, to_insert[ins_idx])
+
+            return new_lst
+
+        def _on_connected_list_patch(patch):
+            """Apply a jsondiffpatch delta to the connected list."""
+            if not isinstance(patch, dict):
+                return
+            new_list = _apply_jsondiffpatch_array(self._connected_list, patch)
+            self._connected_list[:] = new_list  # mutate in-place so existing references stay valid
             self._connected_list_dirty = True
         self.on("connected-list-patch", _on_connected_list_patch)
         self.on("typing-list",    lambda users: setattr(self, '_typing_list',
@@ -1551,6 +1607,20 @@ class SkyChatClient:
 
     async def join(self, room_id: int) -> None:
         self._current_room_id = room_id
+        # Optimistically update own session in the connected list so the user
+        # list shows the correct in-room presence immediately, without waiting
+        # for the next server patch (which arrives up to 2s later).
+        own_id = self._user.get("id")
+        if own_id is not None:
+            for session in self._connected_list:
+                if session.get("user", {}).get("id") == own_id:
+                    old_rooms = set(session.get("rooms") or [])
+                    # Remove previous room, add new one
+                    if self._current_room_id is not None:
+                        old_rooms.discard(self._current_room_id)
+                    session["rooms"] = list(old_rooms | {room_id})
+                    self._connected_list_dirty = True
+                    break
         await self.send_message(f"/join {room_id}")
 
     async def send_message(self, msg: str) -> None:
@@ -3481,6 +3551,15 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     await client.send_message(f"/join {room['id']}")
                     await asyncio.sleep(0.3)
                     await client.send_message(f"/pmleave {room['id']}")
+                    # Optimistically remove room from own session in connected list
+                    _leave_rid = room['id']
+                    _own_id = client.current_user.get("id")
+                    if _own_id is not None:
+                        for _sess in client._connected_list:
+                            if _sess.get("user", {}).get("id") == _own_id:
+                                _sess["rooms"] = [r for r in (_sess.get("rooms") or []) if r != _leave_rid]
+                                client._connected_list_dirty = True
+                                break
                     ui.set_status(f"Left {room.get('name', room['id'])}", ttl=3.0)
                 else:
                     ui.set_status("✗  Can't leave public rooms", ttl=2.0)
