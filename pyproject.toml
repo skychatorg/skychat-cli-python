@@ -16,10 +16,10 @@ dependencies = [
 ]
 
 [project.scripts]
-skychat = "skychat_tui.client:main"
+skychat = "skychat_tui.main:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
 include = ["skychat_tui*"]
 
 [tool.setuptools.data-files]
