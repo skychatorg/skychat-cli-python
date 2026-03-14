@@ -841,14 +841,27 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                             continue
                         elif rest == '200~':
                             # ── Bracketed paste start ──────────────────────────
-                            # Drain everything until \x1b[201~ into paste_buf
-                            paste_buf = ''
-                            _ESC_seen = False
+                            # Drain everything until \x1b[201~ into paste_buf.
+                            # Hard deadline: if 201~ never arrives (dropped
+                            # connection, malformed terminal) we break after 5 s
+                            # and process whatever we accumulated, so the TUI
+                            # never hangs permanently.
+                            paste_buf    = ''
+                            _ESC_seen    = False
+                            _paste_deadline = time.monotonic() + 5.0
                             while True:
+                                # Safety check: bail if deadline exceeded even
+                                # when chars are arriving continuously.
+                                if time.monotonic() > _paste_deadline:
+                                    break
                                 try:
                                     pc = stdscr.get_wch()
                                 except curses.error:
                                     await asyncio.sleep(0.005)
+                                    # Check deadline at every yield point so a
+                                    # stalled terminal can't spin here forever.
+                                    if time.monotonic() > _paste_deadline:
+                                        break
                                     continue
                                 pc = pc if isinstance(pc, str) else chr(pc)
                                 if _ESC_seen:
@@ -860,6 +873,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                                                 tc = stdscr.get_wch()
                                             except curses.error:
                                                 await asyncio.sleep(0.002)
+                                                if time.monotonic() > _paste_deadline:
+                                                    break
                                                 continue
                                             term += tc if isinstance(tc, str) else chr(tc)
                                             if term.endswith('~') or (term and term[-1].isalpha()):
