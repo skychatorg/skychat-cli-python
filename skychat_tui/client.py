@@ -5,10 +5,14 @@ No curses, no rendering. All UI interaction goes through the event system.
 
 import asyncio
 import json
+import logging
 import random
 import struct
 import time
 from typing import Any, Callable, Dict, List, Optional
+
+_dbg = logging.getLogger('skychat')
+_dbg.addHandler(logging.NullHandler())
 
 try:
     import websockets
@@ -124,8 +128,8 @@ class SkyChatClient:
                 r = h(payload)
                 if asyncio.iscoroutine(r):
                     asyncio.ensure_future(r)
-            except Exception:
-                pass
+            except Exception as e:
+                _dbg.debug('handler exception for event %r: %s', event, e, exc_info=True)
 
     def _on_set_user(self, user: Dict) -> None:
         self._user = user
