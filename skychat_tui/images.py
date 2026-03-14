@@ -217,7 +217,9 @@ def _open_url(url: str, opener: str, stdscr) -> None:
 
     For terminal browsers (browsh, w3m): suspends curses, runs the browser
     in the foreground, then reinitialises curses so the TUI can resume cleanly.
-    For xdg-open: fires in the background, no curses disruption needed.
+    For all other openers (e.g. xdg-open): fires in the background, no curses
+    disruption needed.  Falls back to :mod:`webbrowser` if the opener binary
+    is not found.
     """
     import curses as _curses
     terminal_browsers = ('browsh', 'w3m')
@@ -233,9 +235,9 @@ def _open_url(url: str, opener: str, stdscr) -> None:
             stdscr.refresh()
             _curses.doupdate()
     else:
-        # xdg-open / webbrowser — non-blocking, no terminal takeover
+        # Non-blocking background launch — respects the configured opener
         try:
-            subprocess.Popen(['xdg-open', url],
+            subprocess.Popen([opener, url],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             import webbrowser
