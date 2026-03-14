@@ -20,7 +20,7 @@ except ImportError:
     _WEBSOCKETS_OK = False
 
 from .constants import DEFAULT_WSS_URL, DEFAULT_ROOM_ID, BINARY_MSG_AUDIO, BINARY_MSG_CURSOR
-from .config import save_config
+from .config import save_config, save_token
 from .helpers import _apply_jsondiffpatch_array
 
 class SkyChatClient:
@@ -133,7 +133,7 @@ class SkyChatClient:
     def _on_auth_token(self, token) -> None:
         self._token = token
         if token:
-            save_config({"token": token})
+            save_token(token)
 
     def _on_message_internal(self, msg: Dict) -> None:
         if self.auto_message_ack and self._user.get("id", 0) != 0:

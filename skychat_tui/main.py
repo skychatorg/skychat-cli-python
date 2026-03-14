@@ -13,7 +13,7 @@ import urllib.parse
 from typing import Optional
 
 from .constants import DEFAULT_WSS_URL, DEFAULT_ROOM_ID, C_DYN_BASE
-from .config import load_config, save_config
+from .config import load_config, save_config, load_token, save_token
 from .helpers import (
     _strip_tags, _parse_reactions, _get_interactables, _printable_char,
     _room_display_name, _cols_aware_wrap, _str_cols,
@@ -88,7 +88,7 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
         is_dm = room.get("isPrivate", False) if room else False
         mentioned = bool(own) and f'@{own}' in content
         if mentioned:
-            _notify(f'@{own} — {sender}', content[:120])
+            _notify(f'@{own} ← {sender}', content[:120])
         elif is_dm and room_id != client.current_room_id:
             _notify(f'DM from {sender}', content[:120])
         if room_id is not None and room_id != client.current_room_id:
@@ -141,14 +141,14 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
                 new_newest = max(0, len(ui.messages) - 1 - ui.scroll_offset)
                 ui._last_msg_range = (0, new_newest)
                 ui._last_skip_top  = 0
-            ui.set_status(f"↑ {len(ui.messages)} messages loaded", ttl=2.0)
+            ui.set_status(f"✓ {len(ui.messages)} messages loaded", ttl=2.0)
         else:
             ui._history_empty_count += 1
             if ui._history_empty_count >= 2:
                 ui.history_exhausted = True
-                ui.set_status("↑ No more history", ttl=3.0)
+                ui.set_status("✓ No more history", ttl=3.0)
             else:
-                ui.set_status("↑ No new messages", ttl=2.0)
+                ui.set_status("✓ No new messages", ttl=2.0)
 
     @client.on("info")
     def _on_info(t):  ui.set_status(f"ℹ  {t}")
@@ -157,7 +157,7 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
     def _on_err(t):   ui.set_status(f"✗  {t}")
 
     @client.on("ws-open")
-    def _on_open(_):  ui.set_status("Connected  ●  skych.at", ttl=4.0)
+    def _on_open(_):  ui.set_status("Connected  ✓  skych.at", ttl=4.0)
 
     @client.on("set-user")
     def _on_set_user_save(user):
@@ -292,16 +292,16 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     ui     = ChatUI(stdscr)
     client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
 
-    # ── Event wiring ──────────────────────────────────────────────────
+    # ── Event wiring ────────────────────────────────────────────────────
     _wire_events(client, ui)
 
-    # ── Connect & auth ────────────────────────────────────────────────
+    # ── Connect & auth ──────────────────────────────────────────────────
     conn_task = await _connect_and_auth(
         client, ui, stdscr, username, password, guest, saved_token)
     if conn_task is None:
         return  # auth failed, already cleaned up
 
-    # ── Key handlers ─────────────────────────────────────────────────
+    # ── Key handlers ────────────────────────────────────────────────────
 
     async def _handle_menu_key(key) -> bool:
         """Handle a keypress while the menu is open. Returns True to exit the loop."""
@@ -338,7 +338,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.colour_pick_open = False
                 ui.menu_open = False
                 ui.set_status(f'Colour set to {entry.get("name", cid)}', ttl=3.0)
-            elif key in ('', curses.KEY_BACKSPACE, 127, '', 8):
+            elif key in ('\x1b', curses.KEY_BACKSPACE, 127, '\x7f', 8):
                 ui.colour_pick_open = False
             return False
 
@@ -387,7 +387,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status('✗  Colour list not yet received', ttl=3.0)
             elif ui.menu_cursor == 6:  # Logout
                 ui.menu_open = False
-                save_config({'token': None, 'username': ''})
+                save_token(None)
+                save_config({'username': ''})
                 client._running = False
                 conn_task.cancel()
                 return True
@@ -410,7 +411,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.unread.pop(_rid, None)
                 await client.join(_rid)
                 ui.focus = Focus.INPUT
-        elif key in (curses.KEY_BACKSPACE, 127, '', 8):
+        elif key in (curses.KEY_BACKSPACE, 127, '\x7f', 8):
             if rooms_list and 0 <= ui.room_cursor < len(rooms_list):
                 room = rooms_list[ui.room_cursor]
                 if room.get("isPrivate", False):
@@ -455,7 +456,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     async def _handle_input_key(key) -> bool:
         """Handle a keypress while the INPUT box is focused. Returns True to exit the loop."""
         _enter = (curses.KEY_ENTER, '\n', '\r', 10)
-        _bksp  = (curses.KEY_BACKSPACE, 127, '', 8)
+        _bksp  = (curses.KEY_BACKSPACE, 127, '\x7f', 8)
 
         def _selected_msg():
             if 0 <= ui.scroll_cursor < len(ui.messages):
@@ -538,10 +539,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     _val, _kind = _ias[ui.btn_cursor % len(_ias)]
                     if _kind == 'url' or _val.startswith('http'):
                         _open_url(_val, ui.url_opener, stdscr)
-                        ui.set_status(f'↗  Opened {_val[:50]}', ttl=3.0)
+                        ui.set_status(f'✓  Opened {_val[:50]}', ttl=3.0)
                     else:
                         asyncio.ensure_future(client.send_message(_val))
-                        ui.set_status(f'▶  Sent: {_val[:50]}', ttl=2.0)
+                        ui.set_status(f'✓  Sent: {_val[:50]}', ttl=2.0)
                 else:
                     ui.set_status('No links or buttons in this message', ttl=2.0)
 
@@ -601,7 +602,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         return False
 
-    # ── Paste handler ────────────────────────────────────────────────
+    # ── Paste handler ────────────────────────────────────────────────────
     _upload_base_url = _wss_to_http(DEFAULT_WSS_URL)
 
     async def _handle_paste(text: str) -> None:
@@ -628,7 +629,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status(f'✗ Upload failed: {e}', ttl=5)
                 return
 
-        # ── Detect file:// URI (drag-drop from file manager) ──────────
+        # ── Detect file:// URI (drag-drop from file manager) ────────────
         if stripped.startswith('file://'):
             local_path = stripped[7:]   # strip file://
             # Strip hostname if present (file:///home/... → /home/...)
@@ -651,7 +652,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.set_status(f'✗ Upload failed: {e}', ttl=5)
             return
 
-        # ── Detect bare local file path ────────────────────────────────
+        # ── Detect bare local file path ─────────────────────────────────
         if stripped and os.path.isabs(stripped) and os.path.isfile(stripped):
             ui.set_status(f'⬆ Uploading {os.path.basename(stripped)}…', ttl=30)
             try:
@@ -666,7 +667,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.set_status(f'✗ Upload failed: {e}', ttl=5)
             return
 
-        # ── Plain text paste — bulk insert (fast, single redraw) ──────
+        # ── Plain text paste — bulk insert (fast, single redraw) ────────
         if ui.scroll_cursor < 0 and ui.focus == Focus.INPUT:
             # Normalise \r\n and \r to \n
             text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -675,7 +676,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.input_buf  = before + text + after
             ui.cursor_pos = len(before) + len(text)
 
-    # ── Main loop ─────────────────────────────────────────────────────
+    # ── Main loop ────────────────────────────────────────────────────────
 
     if ui.image_preview_enabled:
         if _img_mod._IMG_PROTO is None:
@@ -721,7 +722,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 unread_checker  = client.has_unread_messages,
             )
 
-        # ── Hover image preview ───────────────────────────────────────
+        # ── Hover image preview ─────────────────────────────────────────
         if _img_mod._IMG_PROTO and ui.image_preview_enabled:
             _new_hover = ""
             if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
@@ -839,7 +840,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                                 ui.insert_char('\n')
                             continue
                         elif rest == '200~':
-                            # ── Bracketed paste start ─────────────────────────
+                            # ── Bracketed paste start ──────────────────────────
                             # Drain everything until \x1b[201~ into paste_buf
                             paste_buf = ''
                             _ESC_seen = False
@@ -877,7 +878,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                                 else:
                                     paste_buf += pc
 
-                            # ── Process the pasted content ────────────────────
+                            # ── Process the pasted content ───────────────────
                             await _handle_paste(paste_buf)
                             continue
                         # Unknown CSI — fall through to Esc handling, discard rest
@@ -988,7 +989,7 @@ def _run(stdscr, cli_username: Optional[str], cli_password: Optional[str]) -> No
         resume      = False
     else:
         saved_username = cfg.get("username", "")
-        saved_token    = cfg.get("token")
+        saved_token    = load_token()
         result = ncurses_login(stdscr, prefill_username=saved_username,
                                has_token=bool(saved_token))
         if result is None:

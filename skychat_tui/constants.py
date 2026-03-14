@@ -12,7 +12,16 @@ DEFAULT_WSS_URL = os.environ.get("SKYCHAT_URL", "wss://skych.at/api/ws")
 DEFAULT_ROOM_ID = 0
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_FILE = os.path.expanduser("~/.skychat_tui.json")
+# Respect XDG_CONFIG_HOME; fall back to ~/.config
+CONFIG_DIR    = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "skychat",
+)
+CONFIG_FILE   = os.path.join(CONFIG_DIR, "config.json")
+TOKEN_FILE    = os.path.join(CONFIG_DIR, "token.json")
+
+# Legacy path — migrated automatically on first load, then deleted
+_LEGACY_CONFIG = os.path.expanduser("~/.skychat_tui.json")
 
 # ── Binary message types ──────────────────────────────────────────────────────
 BINARY_MSG_AUDIO  = 0
