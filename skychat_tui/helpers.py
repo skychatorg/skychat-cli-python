@@ -191,15 +191,23 @@ def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
     jsondiffpatch array delta keys:
       "_N" with [val, 0, 0]   -> delete item originally at index N
       "_N" with [old, new, 3] -> item moved from index N to new index
-      "N"  with [val]         -> insert val at index N in the result
-      "N"  with {...}         -> nested object delta at index N
+      "N"  with [val]         -> insert val at result index N
+      "N"  with {...}         -> nested object delta for item at result index N
+
+    Three-phase approach to ensure correct index semantics:
+      1. Delete  — filter out items by their original indices.
+      2. Insert  — splice new items in at their result indices (sorted so
+                   each successive insert is unaffected by earlier ones).
+      3. Modify  — apply nested field deltas using result indices against the
+                   now-settled list (avoids the off-by-one that arises when
+                   modifications are applied during the delete pass).
     """
     if not isinstance(delta, dict) or delta.get('_t') != 'a':
         return lst
 
-    to_delete = {}
-    to_insert = {}
-    to_modify = {}
+    to_delete: set  = set()
+    to_insert: dict = {}   # result_idx -> value
+    to_modify: dict = {}   # result_idx -> sub_delta
 
     for key, val in delta.items():
         if key == '_t':
@@ -207,9 +215,11 @@ def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
         if key.startswith('_'):
             orig_idx = int(key[1:])
             if isinstance(val, list) and len(val) == 3 and val[1] == 0 and val[2] == 0:
-                to_delete[orig_idx] = None
+                # delete
+                to_delete.add(orig_idx)
             elif isinstance(val, list) and len(val) == 3 and val[2] == 3:
-                to_delete[orig_idx] = ('move', val[1])
+                # move: treat as delete-from-original + insert-at-result
+                to_delete.add(orig_idx)
                 to_insert[val[1]] = lst[orig_idx] if orig_idx < len(lst) else val[0]
         else:
             result_idx = int(key)
@@ -218,24 +228,30 @@ def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
             elif isinstance(val, dict):
                 to_modify[result_idx] = val
 
-    new_lst = []
-    for i, item in enumerate(lst):
-        if i in to_delete:
-            continue
-        if i in to_modify:
-            sub = to_modify[i]
-            if isinstance(item, dict) and isinstance(sub, dict):
-                item = dict(item)
-                for fk, fv in sub.items():
-                    if isinstance(fv, list) and len(fv) == 2:
-                        item[fk] = fv[1]
-                    elif isinstance(fv, list) and len(fv) == 1:
-                        item[fk] = fv[0]
-                    elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
-                        item.pop(fk, None)
-        new_lst.append(item)
+    # Phase 1: delete
+    new_lst = [item for i, item in enumerate(lst) if i not in to_delete]
 
+    # Phase 2: insert — process in ascending index order so each insertion
+    # lands at the correct position without needing an offset adjustment.
     for ins_idx in sorted(to_insert.keys()):
         new_lst.insert(ins_idx, to_insert[ins_idx])
+
+    # Phase 3: modify — now that the list is in its final shape we can
+    # address items by their result indices directly.
+    for mod_idx, sub in to_modify.items():
+        if not (0 <= mod_idx < len(new_lst)):
+            continue
+        item = new_lst[mod_idx]
+        if not (isinstance(item, dict) and isinstance(sub, dict)):
+            continue
+        item = dict(item)
+        for fk, fv in sub.items():
+            if isinstance(fv, list) and len(fv) == 2:
+                item[fk] = fv[1]
+            elif isinstance(fv, list) and len(fv) == 1:
+                item[fk] = fv[0]
+            elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
+                item.pop(fk, None)
+        new_lst[mod_idx] = item
 
     return new_lst
