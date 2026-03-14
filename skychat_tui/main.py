@@ -74,7 +74,7 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
         own = client.current_user.get("username", "")
         sender_obj = msg.get("user", {})
         sender = sender_obj.get("username", "") if isinstance(sender_obj, dict) else str(sender_obj)
-        if ui.blacklist and sender.lower() in ui.blacklist:
+        if ui._is_hidden(sender):
             return
         content = _strip_tags(msg.get("content") or msg.get("formatted") or "")
         raw_rid = msg.get("room") if msg.get("room") is not None else msg.get("roomId")
@@ -117,11 +117,10 @@ def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
             mid = m.get("id", 0)
             if mid and mid in existing_ids:
                 continue
-            if ui.blacklist:
-                s = m.get('user', {})
-                s = s.get('username', '') if isinstance(s, dict) else str(s)
-                if s.lower() in ui.blacklist:
-                    continue
+            _s = m.get('user', {})
+            _s = _s.get('username', '') if isinstance(_s, dict) else str(_s)
+            if ui._is_hidden(_s):
+                continue
             entry = ChatUI._msg_to_entry(m, storage=m.get("storage"))
             if entry:
                 prepend.append(entry)
@@ -344,7 +343,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return False
 
         # Main menu
-        menu_items_count = 7
+        menu_items_count = 8
         if key == curses.KEY_UP:
             ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
         elif key == curses.KEY_DOWN:
@@ -376,19 +375,23 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.url_opener = available[(idx + 1) % len(available)]
                 save_config({'url_opener': ui.url_opener})
                 ui.set_status(f'Open URLs with: {ui.url_opener}', ttl=2.0)
-            elif ui.menu_cursor == 4:  # Pick colour
+            elif ui.menu_cursor == 4:  # Hide guests
+                ui.hide_guests = not ui.hide_guests
+                save_config({'hide_guests': ui.hide_guests})
+                ui.set_status(f'Hide guests {"ON" if ui.hide_guests else "OFF"}', ttl=2.0)
+            elif ui.menu_cursor == 5:  # Pick colour
                 if ui.colour_list:
                     ui.colour_pick_open   = True
                     ui.colour_pick_cursor = 0
                 else:
                     ui.set_status('✗  Colour list not yet received', ttl=3.0)
-            elif ui.menu_cursor == 5:  # Logout
+            elif ui.menu_cursor == 6:  # Logout
                 ui.menu_open = False
                 save_config({'token': None, 'username': ''})
                 client._running = False
                 conn_task.cancel()
                 return True
-            elif ui.menu_cursor == 6:  # Quit
+            elif ui.menu_cursor == 7:  # Quit
                 ui.menu_open = False
                 client._running = False
                 conn_task.cancel()

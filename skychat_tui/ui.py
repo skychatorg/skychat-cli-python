@@ -240,6 +240,7 @@ class ChatUI:
         self.url_opener: str                   = load_config().get('url_opener', 'xdg-open')
         _bl = load_config().get('blacklist', [])
         self.blacklist: set = {u.lower() for u in _bl if isinstance(u, str)}
+        self.hide_guests: bool = load_config().get('hide_guests', False)
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -332,12 +333,20 @@ class ChatUI:
             "reactions": _parse_reactions(storage) if storage else {},
         }
 
+    def _is_hidden(self, username: str) -> bool:
+        """Return True if this username should be suppressed client-side."""
+        ul = username.lower()
+        if self.blacklist and ul in self.blacklist:
+            return True
+        if self.hide_guests and username.startswith('*'):
+            return True
+        return False
+
     def add_message(self, msg: Dict) -> None:
-        if self.blacklist:
-            sender = msg.get('user', {})
-            uname = sender.get('username', '') if isinstance(sender, dict) else str(sender)
-            if uname.lower() in self.blacklist:
-                return
+        sender = msg.get('user', {})
+        uname = sender.get('username', '') if isinstance(sender, dict) else str(sender)
+        if self._is_hidden(uname):
+            return
         entry = self._msg_to_entry(msg)
         if entry:
             self.messages.append(entry)
@@ -366,6 +375,7 @@ class ChatUI:
             f"Notifications: {'ON' if self.notifications_enabled else 'OFF'}",
             f"Image Preview: {'ON' if self.image_preview_enabled else 'OFF'}",
             f"Open URLs with: {self.url_opener}",
+            f"Hide guests: {'ON' if self.hide_guests else 'OFF'}",
             "Pick username color…" if self.colour_list else "Pick color (not loaded)",
             "Logout",
             "Quit",
@@ -451,8 +461,7 @@ class ChatUI:
                  unread_checker: Optional[Callable] = None) -> None:
         self._own_user = own_user
         if typing_list is not None:
-            self.typing_list = [u for u in typing_list
-                                if not self.blacklist or u.lower() not in self.blacklist]
+            self.typing_list = [u for u in typing_list if not self._is_hidden(u)]
         try:
             self._draw_header(rooms, current_room_id, own_username)
             self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker, own_username=own_username)
@@ -935,7 +944,7 @@ class ChatUI:
         in_room, out_room = [], []
         for session in connected_list:
             uname = session.get('user', {}).get('username', '') or ''
-            if self.blacklist and uname.lower() in self.blacklist:
+            if self._is_hidden(uname):
                 continue
             rooms = session.get("rooms") or []
             try:
