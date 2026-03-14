@@ -155,41 +155,6 @@ def _setup_colors() -> None:
     _init_caca_pairs()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _input_wrap_line(text: str, width: int) -> list:
-    """Word-aware wrap of a single logical input line into chunks of at most `width` cols.
-    Words are kept whole; only breaks mid-word if a single word exceeds width.
-    """
-    if not text:
-        return ['']
-    chunks: list = []
-    current = ''
-    for word in text.split(' '):
-        if not current:
-            while len(word) > width:
-                chunks.append(word[:width])
-                word = word[width:]
-            current = word
-        elif len(current) + 1 + len(word) <= width:
-            current += ' ' + word
-        else:
-            chunks.append(current)
-            current = ''
-            while len(word) > width:
-                chunks.append(word[:width])
-                word = word[width:]
-            current = word
-    if current or not chunks:
-        chunks.append(current)
-    return chunks
-
-
-def _input_visual_rows(line: str, width: int) -> int:
-    """Number of visual rows a logical input line occupies after word-aware wrap."""
-    return max(1, len(_input_wrap_line(line, width)))
-
-
 SIDEBAR_W   = 22
 INPUT_H     = 3   # minimum input box height (1 border top + 1 text + 1 border bottom)
 INPUT_H_MAX = 7   # maximum input box height (caps at 5 text lines)
@@ -269,7 +234,7 @@ class ChatUI:
     def _update_input_height(self) -> bool:
         """Recompute input_h from current input_buf. Returns True if height changed."""
         vis_w = max(1, self.chat_w - 4)
-        visual_rows = sum(_input_visual_rows(ln, vis_w) for ln in self.input_buf.split('\n'))
+        visual_rows = sum(len(_cols_aware_wrap(ln, vis_w)) for ln in self.input_buf.split('\n'))
         new_h = min(INPUT_H_MAX, max(INPUT_H, visual_rows + 2))  # +2 for borders
         if new_h != self.input_h:
             self.input_h = new_h
@@ -1113,7 +1078,7 @@ class ChatUI:
         char_idx = 0
         for li, line in enumerate(logical_lines):
             # Split logical line into word-aware chunks
-            chunks = _input_wrap_line(line, vis_w) if line else ['']
+            chunks = _cols_aware_wrap(line, vis_w)
             chunk_offset = 0
             for ci, chunk in enumerate(chunks):
                 vrow = len(visual_lines)
