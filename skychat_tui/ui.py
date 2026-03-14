@@ -155,9 +155,12 @@ def _setup_colors() -> None:
     _init_caca_pairs()
 
 
-SIDEBAR_W   = 22
-INPUT_H     = 3   # minimum input box height (1 border top + 1 text + 1 border bottom)
-INPUT_H_MAX = 7   # maximum input box height (caps at 5 text lines)
+SIDEBAR_W      = 22
+INPUT_H        = 3   # minimum input box height (1 border top + 1 text + 1 border bottom)
+INPUT_H_MAX    = 7   # maximum input box height (caps at 5 text lines)
+# Number of items in the Esc menu — single source of truth shared with main.py
+# so cursor wrap and item list can never silently diverge.
+MENU_ITEM_COUNT = 8
 
 
 class ChatUI:
@@ -1173,8 +1176,9 @@ class ChatUI:
         self.input_buf      = ""
         self.cursor_pos     = 0
         self.input_vscroll  = 0
-        self.input_h        = INPUT_H
-        self._build_windows()
+        if self.input_h != INPUT_H:
+            self.input_h = INPUT_H
+            self._build_windows()
         return t
 
     def _user_colour_pair(self, xterm_idx: int) -> int:

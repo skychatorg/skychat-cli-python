@@ -27,6 +27,7 @@ from .images import (
 import skychat_tui.images as _img_mod
 from .ui import (
     ChatUI, Focus, _setup_colors, _apply_theme, THEMES, THEME_NAMES,
+    MENU_ITEM_COUNT,
 )
 from .client import SkyChatClient
 from .login import ncurses_login, _RESUME_SESSION
@@ -343,11 +344,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return False
 
         # Main menu
-        menu_items_count = 8
         if key == curses.KEY_UP:
-            ui.menu_cursor = (ui.menu_cursor - 1) % menu_items_count
+            ui.menu_cursor = (ui.menu_cursor - 1) % MENU_ITEM_COUNT
         elif key == curses.KEY_DOWN:
-            ui.menu_cursor = (ui.menu_cursor + 1) % menu_items_count
+            ui.menu_cursor = (ui.menu_cursor + 1) % MENU_ITEM_COUNT
         elif key in (curses.KEY_ENTER, '\n', '\r', 10):
             if ui.menu_cursor == 0:   # Cycle theme
                 idx = (THEME_NAMES.index(_active_theme) + 1) % len(THEME_NAMES)
