@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .constants import DEFAULT_WSS_URL, DEFAULT_ROOM_ID, C_DYN_BASE
@@ -31,6 +32,96 @@ from .ui import (
 )
 from .client import SkyChatClient
 from .login import ncurses_login, _RESUME_SESSION
+
+@dataclass
+class _HoverState:
+    """Mutable hover-image state threaded through the main loop and key handlers."""
+    popup:      Optional["ImagePopup"] = field(default=None)
+    url:        str = ""   # URL currently displayed in the open popup
+    cand:       str = ""   # candidate URL (may differ from url while debouncing)
+    since:      float = 0.0
+    suppressed: str = ""   # URL hidden with H — don't re-open until focus moves
+
+    OPEN_DELAY:  float = field(default=0.25, init=False, repr=False)
+    CLOSE_DELAY: float = field(default=0.40, init=False, repr=False)
+
+    def close(self, ui: "ChatUI") -> None:
+        """Close the popup and clear all related state."""
+        if self.popup is not None:
+            self.popup.close()
+            self.popup    = None
+            ui._overlay   = None
+        self.url  = ""
+        self.cand = ""
+        ui.force_full_redraw()
+
+    def suppress(self) -> None:
+        """Mark the current URL as suppressed (H key or Esc)."""
+        self.suppressed = self.url or self.cand
+
+
+def _tick_scroll_ack(ui: "ChatUI", client: "SkyChatClient") -> None:
+    """Send a /lastseen ack once the viewport has been stable on a new high-water mark."""
+    if not ui.messages or client.current_user.get("id", 0) == 0:
+        return
+    oldest_idx, newest_idx = ui._last_msg_range
+    visible_mid = 0
+    for vi in range(newest_idx, oldest_idx - 1, -1):
+        if 0 <= vi < len(ui.messages):
+            mid = ui.messages[vi].get("id", 0)
+            if mid:
+                visible_mid = mid
+                break
+    if visible_mid:
+        client.scroll_ack_tick(visible_mid)
+
+
+def _tick_image_hover(ui: "ChatUI", stdscr, hover: _HoverState) -> None:
+    """Open, close, or switch the image preview popup based on the currently focused URL."""
+    if not (get_image_proto() and ui.image_preview_enabled):
+        return
+
+    new_cand = ""
+    if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
+        ias = _get_interactables(ui.messages[ui.scroll_cursor].get("content", ""))
+        if ias:
+            focused_val, focused_kind = ias[ui.btn_cursor % len(ias)]
+            if focused_kind == "url" and _is_image_url(focused_val):
+                new_cand = focused_val
+
+    # Clear suppression once focus moves to a different URL (or no URL)
+    if hover.suppressed and new_cand != hover.suppressed:
+        hover.suppressed = ""
+
+    now = time.monotonic()
+    if new_cand != hover.cand:
+        hover.cand  = new_cand
+        hover.since = now
+
+    elapsed = now - hover.since
+
+    if hover.popup is None:
+        if hover.cand and hover.cand != hover.suppressed and elapsed >= hover.OPEN_DELAY:
+            hover.url   = hover.cand
+            hover.popup = ImagePopup(stdscr, hover.url)
+            ui._overlay = hover.popup
+            asyncio.ensure_future(hover.popup.load())
+            _dbg.debug('_tick_image_hover: opened %r', hover.url)
+    else:
+        if not hover.cand and elapsed >= hover.CLOSE_DELAY:
+            _dbg.debug('_tick_image_hover: closed (timeout empty)')
+            hover.close(ui)
+        elif hover.cand and hover.cand != hover.url and elapsed >= hover.OPEN_DELAY:
+            _dbg.debug('_tick_image_hover: switched %r -> %r', hover.url, hover.cand)
+            hover.popup.close()
+            hover.popup = None
+            ui._overlay = None
+            ui.force_full_redraw()
+            hover.url   = hover.cand
+            hover.popup = ImagePopup(stdscr, hover.url)
+            ui._overlay = hover.popup
+            asyncio.ensure_future(hover.popup.load())
+
 
 def _wire_events(client: "SkyChatClient", ui: "ChatUI") -> None:
     """Register all client event handlers that bridge the WebSocket layer to the UI."""
@@ -670,13 +761,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     if ui.image_preview_enabled:
         ensure_image_proto()
 
-    image_popup:      Optional[ImagePopup] = None
-    _hover_url:       str                  = ""   # currently open popup URL
-    _hover_cand:      str                       = ""   # current candidate (may differ from open)
-    _hover_since:     float                     = 0.0  # when candidate last changed
-    _hover_suppressed: str                      = ""   # URL hidden with H — don't re-open until focus moves
-    _HOVER_OPEN_MS  = 0.25   # seconds stable before opening
-    _HOVER_CLOSE_MS = 0.40   # seconds empty before closing (tolerates transient resets)
+    hover = _HoverState()
 
     while True:
         rooms_list = client.rooms
@@ -689,11 +774,11 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         # While a sixel image is displayed, skip draw_all entirely to prevent
         # any curses repaint from wiping the sixel pixels and causing a flash.
         # Kitty stores images in terminal memory so doesn't need this guard.
-        _sixel_open = (ui._overlay is not None
-                       and ui._overlay._state == 'ready'
-                       and ui._overlay._proto == 'sixel'
-                       and ui._overlay._placed
-                       and not ui._overlay._pending_place)
+        _sixel_open = (hover.popup is not None
+                       and hover.popup._state == 'ready'
+                       and hover.popup._proto == 'sixel'
+                       and hover.popup._placed
+                       and not hover.popup._pending_place)
         if not _sixel_open:
             ui.draw_all(
                 rooms           = rooms_list,
@@ -705,70 +790,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 unread_checker  = client.has_unread_messages,
             )
 
-        # ── Hover image preview ─────────────────────────────────────────
-        if get_image_proto() and ui.image_preview_enabled:
-            _new_hover = ""
-            if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
-                _ias = _get_interactables(ui.messages[ui.scroll_cursor].get("content", ""))
-                if _ias:
-                    _focused_val, _focused_kind = _ias[ui.btn_cursor % len(_ias)]
-                    if _focused_kind == "url" and _is_image_url(_focused_val):
-                        _new_hover = _focused_val
+        _tick_image_hover(ui, stdscr, hover)
 
-            # Clear suppression once focus moves to a different URL (or no URL)
-            if _hover_suppressed and _new_hover != _hover_suppressed:
-                _hover_suppressed = ""
-
-            _now = time.monotonic()
-            if _new_hover != _hover_cand:
-                _hover_cand  = _new_hover
-                _hover_since = _now
-
-            _elapsed = _now - _hover_since
-
-            if image_popup is None:
-                # Not open — open once candidate has been stable long enough,
-                # but not if the user explicitly hid this URL with H
-                if _hover_cand and _hover_cand != _hover_suppressed and _elapsed >= _HOVER_OPEN_MS:
-                    _hover_url = _hover_cand
-                    image_popup = ImagePopup(stdscr, _hover_url)
-                    ui._overlay = image_popup
-                    asyncio.ensure_future(image_popup.load())
-                    _dbg.debug('popup opened: %r', _hover_url)
-            else:
-                # Open — only close if candidate has been empty long enough,
-                # OR if candidate is a *different* URL that has stabilised
-                if not _hover_cand and _elapsed >= _HOVER_CLOSE_MS:
-                    _dbg.debug('popup closed (timeout empty)')
-                    image_popup.close()
-                    image_popup = None
-                    ui._overlay = None
-                    _hover_url  = ""
-                    ui.force_full_redraw()  # erase sixel artifacts
-                elif _hover_cand and _hover_cand != _hover_url and _elapsed >= _HOVER_OPEN_MS:
-                    _dbg.debug('popup switched: %r -> %r', _hover_url, _hover_cand)
-                    image_popup.close()
-                    image_popup = None
-                    ui._overlay = None
-                    ui.force_full_redraw()  # erase previous sixel before new one loads
-                    _hover_url  = _hover_cand
-                    image_popup = ImagePopup(stdscr, _hover_url)
-                    ui._overlay = image_popup
-                    asyncio.ensure_future(image_popup.load())
-
-        # Scroll-read ack: find the highest message-id currently on screen
-        # and notify the server once the viewport has been stable for 1s.
-        if ui.messages and client.current_user.get("id", 0) != 0:
-            oldest_idx, newest_idx = ui._last_msg_range
-            _visible_mid = 0
-            for _vi in range(newest_idx, oldest_idx - 1, -1):
-                if 0 <= _vi < len(ui.messages):
-                    _mid = ui.messages[_vi].get("id", 0)
-                    if _mid:
-                        _visible_mid = _mid
-                        break
-            if _visible_mid:
-                client.scroll_ack_tick(_visible_mid)
+        _tick_scroll_ack(ui, client)
 
         try:
             key = stdscr.get_wch()
@@ -778,8 +802,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         if key == curses.KEY_RESIZE:
             ui.resize()
-            if image_popup is not None:
-                image_popup.resize()
+            if hover.popup is not None:
+                hover.popup.resize()
             # Drain any further resize events that queued up during the resize
             # so we don't spin through them all without ever yielding.
             while True:
@@ -890,13 +914,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
         # Esc: close popup if open (suppressed like H), otherwise toggle menu
         if key == '\x1b':
-            if image_popup is not None:
-                _hover_suppressed = _hover_url or _hover_cand
-                image_popup.close()
-                image_popup = None
-                ui._overlay = None
-                _hover_url = _hover_cand = ""
-                ui.force_full_redraw()
+            if hover.popup is not None:
+                hover.suppress()
+                hover.close(ui)
                 ui.menu_open = True
                 ui.menu_cursor = 0
                 ui.colour_pick_open = False
@@ -913,12 +933,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             if await _handle_menu_key(key):
                 break
             # If image preview was just disabled, close any open popup immediately
-            if not ui.image_preview_enabled and image_popup is not None:
-                image_popup.close()
-                image_popup = None
-                ui._overlay = None
-                _hover_url = _hover_cand = ""
-                ui.force_full_redraw()
+            if not ui.image_preview_enabled and hover.popup is not None:
+                hover.close(ui)
             continue
 
         if key == '\t':
@@ -934,20 +950,15 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             continue
 
         # O = open popup URL with configured opener
-        if key in ('o', 'O') and image_popup is not None and _hover_url:
-            _open_url(_hover_url, ui.url_opener, stdscr)
+        if key in ('o', 'O') and hover.popup is not None and hover.url:
+            _open_url(hover.url, ui.url_opener, stdscr)
             ui.force_full_redraw()
             continue
 
         # H = hide image popup (stays hidden until focus moves to a different URL)
-        if key in ('h', 'H') and image_popup is not None:
-            _hover_suppressed = _hover_url or _hover_cand
-            image_popup.close()
-            image_popup = None
-            ui._overlay = None
-            _hover_url  = ""
-            _hover_cand = ""
-            ui.force_full_redraw()
+        if key in ('h', 'H') and hover.popup is not None:
+            hover.suppress()
+            hover.close(ui)
             continue
 
         if ui.focus == Focus.ROOMS:
