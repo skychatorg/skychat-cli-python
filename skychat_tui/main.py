@@ -24,7 +24,7 @@ from .images import (
     _wss_to_http, _upload_file_bytes, _upload_local_file,
     _grab_clipboard_image, _is_image_url, _dbg, ImagePopup,
     _get_upload_method, _detect_url_openers, _open_url,
-    ensure_image_proto, get_image_proto,
+    ensure_image_proto, get_image_proto, _copy_to_clipboard,
 )
 from .ui import (
     ChatUI, Focus, _setup_colors, _apply_theme, THEMES, THEME_NAMES,
@@ -610,6 +610,15 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.scroll_bottom()
             elif msg:
                 ui.set_status("✗  Can only edit your own messages", ttl=2.0)
+
+        elif key in ('c', 'C') and ui.scroll_cursor >= 0:
+            msg = _selected_msg()
+            if msg:
+                text = msg.get('content', '')
+                if _copy_to_clipboard(text):
+                    ui.set_status('✓  Copied to clipboard', ttl=2.0)
+                else:
+                    ui.set_status('✗  No clipboard tool found (install xclip or wl-copy)', ttl=4.0)
 
         elif key in ('o', 'O') and ui.scroll_cursor >= 0:
             msg = _selected_msg()

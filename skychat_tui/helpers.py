@@ -54,10 +54,16 @@ def _cols_slice(s: str, max_cols: int) -> str:
     return ''.join(result)
 
 
-def _cols_aware_wrap(text: str, width: int) -> List[str]:
+def _cols_aware_wrap(text: str, width: int, keep_trailing: bool = False) -> List[str]:
     """Word-aware, column-aware line wrap.  Keeps whole words together and
     only breaks mid-word when a single word exceeds the available width.
-    Also splits after ']' so button runs don't overflow."""
+    Also splits after ']' so button runs don't overflow.
+
+    *keep_trailing* — when True the final chunk is not rstripped.  Pass
+    True when the result is used for cursor-position tracking (i.e. in the
+    input box renderer) so that a trailing space does not cause the cursor
+    to jump to the beginning of the line.
+    """
     if not text:
         return [""]
 
@@ -96,7 +102,7 @@ def _cols_aware_wrap(text: str, width: int) -> List[str]:
             current_cols = _str_cols(stripped)
 
     if current.strip():
-        lines.append(current.rstrip())
+        lines.append(current if keep_trailing else current.rstrip())
 
     return lines or [""]
 

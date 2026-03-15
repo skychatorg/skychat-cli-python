@@ -299,6 +299,36 @@ def _get_upload_method() -> Optional[str]:
     return _UPLOAD_METHOD
 
 
+def _copy_to_clipboard(text: str) -> bool:
+    """Write *text* to the system clipboard.
+
+    Tries, in order: xclip (X11), wl-copy (Wayland), pbcopy (macOS),
+    xdotool type (last-resort X11 fallback).
+    Returns True on success, False if no clipboard tool was found.
+    """
+    tools = []
+    if shutil.which('xclip'):
+        tools.append(['xclip', '-selection', 'clipboard'])
+    if shutil.which('wl-copy'):
+        tools.append(['wl-copy'])
+    if shutil.which('pbcopy'):
+        tools.append(['pbcopy'])
+
+    for cmd in tools:
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=text.encode('utf-8'),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _wss_to_http(wss_url: str) -> str:
     """Convert wss://host/path to https://host"""
     return wss_url.replace('wss://', 'https://').replace('ws://', 'http://').split('/api/')[0]

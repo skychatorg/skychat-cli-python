@@ -1081,7 +1081,7 @@ class ChatUI:
         char_idx = 0
         for li, line in enumerate(logical_lines):
             # Split logical line into word-aware chunks
-            chunks = _cols_aware_wrap(line, vis_w)
+            chunks = _cols_aware_wrap(line, vis_w, keep_trailing=True)
             chunk_offset = 0
             for ci, chunk in enumerate(chunks):
                 vrow = len(visual_lines)
