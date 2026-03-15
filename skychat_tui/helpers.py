@@ -107,6 +107,81 @@ def _cols_aware_wrap(text: str, width: int, keep_trailing: bool = False) -> List
     return lines or [""]
 
 
+
+def _cols_aware_wrap_offsets(text: str, width: int) -> List[Tuple[str, int]]:
+    """Like :func:`_cols_aware_wrap` but returns ``(chunk, start_in_text)`` pairs.
+
+    The start offset is the index of the chunk's first character in *text*,
+    derived directly from the tokeniser position rather than re-computed by
+    the caller.  This is the correct form to use for cursor-position tracking
+    because it stays accurate across both space-split wraps (where one
+    whitespace character is consumed between chunks) and word-break wraps
+    (where no separator is consumed and a naive ``+1`` offset would be wrong).
+    """
+    if not text:
+        return [("", 0)]
+
+    tokens       = re.split(r'(\s+)', text)
+    result: List[Tuple[str, int]] = []
+    current      = ""
+    current_cols = 0
+    current_start = 0   # start of *current* accumulation buffer in *text*
+    pos          = 0    # running position in *text*
+
+    for token in tokens:
+        if not token:
+            continue
+        token_cols = _str_cols(token)
+
+        if current_cols + token_cols <= width:
+            if not current:
+                current_start = pos
+            current      += token
+            current_cols += token_cols
+            pos          += len(token)
+
+        elif token_cols > width:
+            # Token wider than one line — flush current, then break char-by-char
+            if current.strip():
+                result.append((current.rstrip(), current_start))
+            current, current_cols = "", 0
+            tok_start = pos
+            char_buf  = ""
+            char_buf_start = pos
+            for ch in token:
+                ch_w = _char_width(ch)
+                if current_cols + ch_w > width:
+                    if char_buf:
+                        result.append((char_buf, char_buf_start))
+                    char_buf       = ch
+                    char_buf_start = tok_start
+                    current_cols   = ch_w
+                else:
+                    char_buf     += ch
+                    current_cols += ch_w
+                tok_start += 1
+            current       = char_buf
+            current_start = char_buf_start
+            pos          += len(token)
+
+        else:
+            # Token doesn't fit on current line — flush and start fresh
+            if current.strip():
+                result.append((current.rstrip(), current_start))
+            pos          += len(token)
+            stripped      = token.lstrip()
+            current_start = pos - len(stripped)
+            current       = stripped
+            current_cols  = _str_cols(stripped)
+
+    if current.strip():
+        # Keep trailing whitespace so cursor-position math works correctly
+        # (a trailing space increments cursor_pos but rstrip would hide it).
+        result.append((current, current_start))
+
+    return result or [("", 0)]
+
+
 # ── Content parsing ───────────────────────────────────────────────────────────
 
 def _get_interactables(content: str) -> List[Tuple[str, str]]:

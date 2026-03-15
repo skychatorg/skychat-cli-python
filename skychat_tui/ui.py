@@ -23,7 +23,7 @@ from .constants import (
 from .config import load_config, save_config
 from .helpers import (
     _printable_char, _strip_tags, _char_width, _str_cols, _cols_slice,
-    _cols_aware_wrap, _get_interactables, _hex_to_xterm256,
+    _cols_aware_wrap, _cols_aware_wrap_offsets, _get_interactables, _hex_to_xterm256,
     _parse_reactions, _user_status, _parse_msg_ts, _room_display_name,
 )
 from .images import (
@@ -1080,19 +1080,19 @@ class ChatUI:
         logical_lines = self.input_buf.split('\n')
         char_idx = 0
         for li, line in enumerate(logical_lines):
-            # Split logical line into word-aware chunks
-            chunks = _cols_aware_wrap(line, vis_w, keep_trailing=True)
-            chunk_offset = 0
-            for ci, chunk in enumerate(chunks):
+            # _cols_aware_wrap_offsets returns (chunk, start_in_line) pairs.
+            # Using start_in_line directly avoids the off-by-one that occurs
+            # when a word-break wrap (no separator consumed) is incorrectly
+            # treated the same as a space-split wrap (+1 separator).
+            pairs = _cols_aware_wrap_offsets(line, vis_w)
+            for chunk, start_in_line in pairs:
                 vrow = len(visual_lines)
-                chunk_start = char_idx + chunk_offset
+                chunk_start = char_idx + start_in_line
                 chunk_end   = chunk_start + len(chunk)
                 if chunk_start <= self.cursor_pos <= chunk_end:
                     cur_vrow = vrow
                     cur_vcol = self.cursor_pos - chunk_start
                 visual_lines.append(chunk)
-                # +1 for the space consumed between wrapped words
-                chunk_offset += len(chunk) + (1 if ci < len(chunks) - 1 else 0)
             char_idx += len(line) + 1  # +1 for \n
 
         # Vertical scroll: keep cursor visible
