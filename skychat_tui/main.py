@@ -19,12 +19,12 @@ from .helpers import (
     _room_display_name, _cols_aware_wrap, _str_cols,
 )
 from .images import (
-    _enable_debug_logging, _detect_protocol, _query_cell_pixels,
+    _enable_debug_logging,
     _wss_to_http, _upload_file_bytes, _upload_local_file,
     _grab_clipboard_image, _is_image_url, _dbg, ImagePopup,
     _get_upload_method, _detect_url_openers, _open_url,
+    ensure_image_proto, get_image_proto,
 )
-import skychat_tui.images as _img_mod
 from .ui import (
     ChatUI, Focus, _setup_colors, _apply_theme, THEMES, THEME_NAMES,
     MENU_ITEM_COUNT,
@@ -219,7 +219,7 @@ async def _connect_and_auth(
     """
     _resume_fut: Optional[asyncio.Future] = None
     if saved_token and username is None and not guest:
-        client._token = saved_token
+        client.set_token(saved_token)
         _resume_fut   = asyncio.get_running_loop().create_future()
         def _resume_ok(user):
             uname = user.get("username", "")
@@ -257,7 +257,7 @@ async def _connect_and_auth(
         ui.draw_all([], None, [], "")
         stdscr.nodelay(False)
         stdscr.get_wch()
-        client._running = False
+        client.stop()
         conn_task.cancel()
         return None
 
@@ -317,21 +317,18 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 cid     = entry.get('id')
                 hex_val = entry.get('value', '')
                 await client.send_message(f'/custom use color:{cid}')
-                try:
-                    plugins = client._user.setdefault('data', {}).setdefault('plugins', {})
-                    plugins.setdefault('custom', {})['color'] = hex_val
-                except Exception:
-                    pass
+                client.set_user_color(hex_val)
                 own    = client.current_user.get('username', '')
                 own_id = client.current_user.get('id')
-                old_hex = client._user.get('data', {}).get('plugins', {}).get('custom', {}).get('color', '')
+                old_hex = (client.current_user.get('data', {}).get('plugins', {})
+                           .get('custom', {}).get('color', ''))
                 if old_hex:
                     ui._colour_pair_cache.pop(old_hex.lower().lstrip('#'), None)
-                client._user.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
+                client.set_user_color(hex_val)
                 for m in ui.messages:
                     if m.get('user') == own:
                         m['col'] = hex_val
-                for session in client._connected_list:
+                for session in client.connected_list:
                     u = session.get('user', {})
                     if isinstance(u, dict) and u.get('id') == own_id:
                         u.setdefault('data', {}).setdefault('plugins', {}).setdefault('custom', {})['color'] = hex_val
@@ -361,13 +358,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.image_preview_enabled = not ui.image_preview_enabled
                 save_config({'image_preview': ui.image_preview_enabled})
                 if ui.image_preview_enabled:
-                    # Detect protocol now if it wasn't done at startup
-                    if _img_mod._IMG_PROTO is None:
-                        _img_mod._IMG_PROTO = _detect_protocol()
-                        _dbg.debug('image protocol (on enable): %s', _img_mod._IMG_PROTO)
-                    if _img_mod._IMG_PROTO and _img_mod._CELL_PX is None:
-                        _img_mod._CELL_PX = _query_cell_pixels()
-                        _dbg.debug('cell pixels (on enable): %s', _img_mod._CELL_PX)
+                    ensure_image_proto()
                 ui.set_status(f'Image Preview {"ON" if ui.image_preview_enabled else "OFF"}', ttl=2.0)
             elif ui.menu_cursor == 3:  # Cycle URL opener
                 available = _detect_url_openers()
@@ -389,12 +380,12 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.menu_open = False
                 save_token(None)
                 save_config({'username': ''})
-                client._running = False
+                client.stop()
                 conn_task.cancel()
                 return True
             elif ui.menu_cursor == 7:  # Quit
                 ui.menu_open = False
-                client._running = False
+                client.stop()
                 conn_task.cancel()
                 return True
         return False
@@ -422,10 +413,10 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     _leave_rid = room['id']
                     _own_id = client.current_user.get("id")
                     if _own_id is not None:
-                        for _sess in client._connected_list:
+                        for _sess in client.connected_list:
                             if _sess.get("user", {}).get("id") == _own_id:
                                 _sess["rooms"] = [r for r in (_sess.get("rooms") or []) if r != _leave_rid]
-                                client._connected_list_dirty = True
+                                client.mark_connected_list_dirty()
                                 break
                     ui.set_status(f"Left {room.get('name', room['id'])}", ttl=3.0)
                 else:
@@ -488,15 +479,13 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ) or "No rooms")
             elif text == "/who":
                 ui.set_status("Online: " + ", ".join(
-                    s.get("user", {}).get("username", "?") for s in client._connected_list
+                    s.get("user", {}).get("username", "?") for s in client.connected_list
                 ))
             elif text in ("/history", "/messagehistory"):
                 await client.send_message("/messagehistory")
             elif text:
-                if client._typing_active:
-                    client._typing_active = False
-                    if client._typing_task:
-                        client._typing_task.cancel()
+                if client.typing_active:
+                    client.cancel_typing()
                     await client.send_message("/t off")
                 await client.send_message(text)
 
@@ -679,12 +668,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     # ── Main loop ────────────────────────────────────────────────────────
 
     if ui.image_preview_enabled:
-        if _img_mod._IMG_PROTO is None:
-            _img_mod._IMG_PROTO = _detect_protocol()   # 'sixel', 'kitty', 'caca', or None
-            _dbg.debug('image protocol: %s', _img_mod._IMG_PROTO)
-        if _img_mod._IMG_PROTO and _img_mod._CELL_PX is None:
-            _img_mod._CELL_PX = _query_cell_pixels()
-            _dbg.debug('cell pixels: %s', _img_mod._CELL_PX)
+        ensure_image_proto()
 
     image_popup:      Optional[ImagePopup] = None
     _hover_url:       str                  = ""   # currently open popup URL
@@ -696,10 +680,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
     while True:
         rooms_list = client.rooms
-        users_list = client._connected_list
+        users_list = client.connected_list
         # Clear colour pair cache on each connected-list refresh so updated colours render
-        if client._connected_list_dirty:
-            client._connected_list_dirty = False
+        if client.take_connected_list_dirty():
             ui._colour_pair_cache.clear()
             ui._next_pair = C_DYN_BASE
 
@@ -723,7 +706,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             )
 
         # ── Hover image preview ─────────────────────────────────────────
-        if _img_mod._IMG_PROTO and ui.image_preview_enabled:
+        if get_image_proto() and ui.image_preview_enabled:
             _new_hover = ""
             if ui.scroll_cursor >= 0 and 0 <= ui.scroll_cursor < len(ui.messages):
                 _ias = _get_interactables(ui.messages[ui.scroll_cursor].get("content", ""))
@@ -981,7 +964,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     # Cleanup — restore terminal to normal paste mode
     sys.stdout.write('\x1b[?2004l')
     sys.stdout.flush()
-    client._running = False
+    client.stop()
     await client.disconnect()
     conn_task.cancel()
     try:

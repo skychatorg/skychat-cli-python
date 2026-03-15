@@ -69,6 +69,32 @@ def _enable_debug_logging() -> None:
 _CELL_PX:   Optional[Tuple[int, int]] = None   # (w_px, h_px), queried once
 _IMG_PROTO: Optional[str]             = None   # None = not yet probed
 
+
+def ensure_image_proto() -> None:
+    """Detect and cache the best available image protocol and cell pixel size.
+
+    Safe to call multiple times — each value is only computed once.
+    Call this before constructing an :class:`ImagePopup` or checking
+    :func:`get_image_proto`.
+    """
+    global _IMG_PROTO, _CELL_PX
+    if _IMG_PROTO is None:
+        _IMG_PROTO = _detect_protocol()
+        _dbg.debug('ensure_image_proto: protocol=%s', _IMG_PROTO)
+    if _IMG_PROTO and _CELL_PX is None:
+        _CELL_PX = _query_cell_pixels()
+        _dbg.debug('ensure_image_proto: cell_px=%s', _CELL_PX)
+
+
+def get_image_proto() -> Optional[str]:
+    """Return the cached image protocol string, or ``None`` if unavailable.
+
+    Returns ``None`` if :func:`ensure_image_proto` has not been called yet
+    or if no protocol was detected.
+    """
+    return _IMG_PROTO
+
+
 IMAGE_EXTS = frozenset({
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.avif',
 })

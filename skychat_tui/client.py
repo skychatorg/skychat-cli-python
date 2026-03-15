@@ -469,3 +469,47 @@ class SkyChatClient:
     def token(self) -> Optional[Dict]:           return self._token
     @property
     def typing_list(self) -> List[str]:          return self._typing_list
+    @property
+    def typing_active(self) -> bool:             return self._typing_active
+
+    def mark_connected_list_dirty(self) -> None:
+        """Signal that the connected list was mutated in-place by the caller."""
+        self._connected_list_dirty = True
+    @property
+    def connected_list(self) -> List[Dict]:       return self._connected_list
+
+    def take_connected_list_dirty(self) -> bool:
+        """Return True if the connected list changed since the last call, then reset the flag."""
+        dirty = self._connected_list_dirty
+        self._connected_list_dirty = False
+        return dirty
+
+    def stop(self) -> None:
+        """Signal the connection loop to stop reconnecting and exit."""
+        self._running = False
+
+    def set_token(self, token) -> None:
+        """Set the auth token directly (used when resuming a saved session)."""
+        self._token = token
+
+    def cancel_typing(self) -> None:
+        """Immediately cancel any in-flight typing indicator."""
+        self._typing_active = False
+        if self._typing_task and not self._typing_task.done():
+            self._typing_task.cancel()
+
+    def set_user_color(self, hex_val: str) -> None:
+        """Locally apply a new username colour so the UI reflects it immediately.
+
+        Patches the in-memory user dict and every cached message entry; the
+        authoritative server-side change must be sent separately via
+        ``send_message('/custom use color:<id>')``.
+        """
+        try:
+            (self._user
+             .setdefault('data', {})
+             .setdefault('plugins', {})
+             .setdefault('custom', {})
+             )['color'] = hex_val
+        except Exception:
+            pass
