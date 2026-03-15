@@ -537,8 +537,15 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
 
     async def _handle_input_key(key) -> bool:
         """Handle a keypress while the INPUT box is focused. Returns True to exit the loop."""
-        _enter = (curses.KEY_ENTER, '\n', '\r', 10)
-        _bksp  = (curses.KEY_BACKSPACE, 127, '\x7f', 8)
+        _enter     = (curses.KEY_ENTER, '\n', '\r', 10)
+        _bksp      = (curses.KEY_BACKSPACE, 127, '\x7f', 8)
+        # Clear entire input buffer.
+        # \x15 = Ctrl+U (POSIX kill-line, universally supported)
+        # \x1f = Ctrl+Backspace (kitty, alacritty, foot, wezterm)
+        # \x17 = Ctrl+W (kill-word — mapped to clear-all here for simplicity)
+        # \x08 = Ctrl+Backspace on foot (get_wch returns str '\x08',
+        #        distinct from the int 8 in _bksp which covers legacy terminals)
+        _clear_buf = ('\x15', '\x1f', '\x17', '\x08')
 
         def _selected_msg():
             if 0 <= ui.scroll_cursor < len(ui.messages):
@@ -639,6 +646,11 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.scroll_bottom(); ui.scroll_cursor_clear()
         elif key == curses.KEY_SR:
             ui.scroll_up(5)
+
+        elif key in _clear_buf and ui.scroll_cursor < 0:
+            if ui.input_buf:
+                ui.input_buf  = ""
+                ui.cursor_pos = 0
 
         elif key in _bksp:
             msg = _selected_msg()
