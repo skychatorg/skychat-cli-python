@@ -21,10 +21,17 @@
 pip install .
 ```
 
+with inline image preview (Kitty / Sixel):
+
+```bash
+pip install ".[images]"
+```
+
 or dev mode (edits take effect immediately):
 
 ```bash
 pip install -e .
+pip install -e ".[images]"   # dev + image preview
 ```
 
 ## usage
@@ -126,12 +133,19 @@ Hover over an image URL in scroll mode and a preview popup appears automatically
 
 ## config
 
-lives at `~/.skychat_tui.json`:
+Stored in `~/.config/skychat/` (respects `$XDG_CONFIG_HOME`):
+
+| File | Contents |
+|------|----------|
+| `config.json` | all settings (theme, notifications, etc.) |
+| `token.json` | saved auth token — chmod 0o600, separate from other settings |
+
+Both files are created with `0o600` permissions. The directory is `0o700`.
+If `~/.skychat_tui.json` exists from an older version it is migrated automatically on first run and then deleted.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `username` | — | pre-fills the login screen |
-| `token` | — | saved auth token |
 | `theme` | `Dracula` | active color theme |
 | `notifications` | `true` | desktop notifications |
 | `image_preview` | `true` | inline image preview |
@@ -153,9 +167,14 @@ auto-detected at startup, fails gracefully if nothing's available:
 | **Sixel** | `Pillow` + sixel terminal (foot, iTerm2, mlterm) | good quality, minor flicker |
 | **libcaca** | `img2txt` or `python-caca` | coloured ASCII art, works anywhere |
 
+Install Pillow via the `images` extra:
+
 ```bash
-pip install Pillow
+pip install ".[images]"         # from source
+pip install "skychat-tui[images]"  # from PyPI
 ```
+
+libcaca is a system package and is detected separately at runtime:
 
 ```bash
 # Debian/Ubuntu
