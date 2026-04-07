@@ -37,11 +37,12 @@ from .images import (
 # ── Focus ─────────────────────────────────────────────────────────────────────
 
 class Focus(Enum):
-    INPUT = auto()
-    ROOMS = auto()
-    USERS = auto()
+    INPUT  = auto()
+    ROOMS  = auto()
+    USERS  = auto()
+    PLAYER = auto()
 
-FOCUS_ORDER = [Focus.ROOMS, Focus.INPUT, Focus.USERS]
+FOCUS_ORDER = [Focus.ROOMS, Focus.PLAYER, Focus.INPUT, Focus.USERS]
 
 
 # ── Box drawing helper ────────────────────────────────────────────────────────
@@ -160,11 +161,12 @@ def _setup_colors() -> None:
 
 
 SIDEBAR_W      = 22
+PLAYER_H       = 5   # rows reserved for the media player panel
 INPUT_H        = 3   # minimum input box height (1 border top + 1 text + 1 border bottom)
 INPUT_H_MAX    = 7   # maximum input box height (caps at 5 text lines)
 # Number of items in the Esc menu — single source of truth shared with main.py
 # so cursor wrap and item list can never silently diverge.
-MENU_ITEM_COUNT = 8
+MENU_ITEM_COUNT = 9
 
 
 class ChatUI:
@@ -215,6 +217,12 @@ class ChatUI:
         _bl = load_config().get('blacklist', [])
         self.blacklist: set = {u.lower() for u in _bl if isinstance(u, str)}
         self.hide_guests: bool = load_config().get('hide_guests', False)
+        self.media_player_enabled: bool = load_config().get('media_player', False)
+        # Player panel state (updated by main loop)
+        self.player_title:  str  = ""
+        self.player_paused: bool = False
+        self.player_volume: int  = int(load_config().get('player_volume', 100))
+        self.player_active: bool = False
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -229,12 +237,13 @@ class ChatUI:
         chat_w    = max(10, W - SIDEBAR_W * 2)
         chat_h    = max(4,  H - self.input_h - 1)
         sidebar_h = chat_h   # sidebars stop at the same height as the chat pane
-
-        self.win_header = curses.newwin(1,            W,         0,          0)
-        self.win_rooms  = curses.newwin(sidebar_h,    SIDEBAR_W, 1,          0)
-        self.win_chat   = curses.newwin(chat_h,       chat_w,    1,          SIDEBAR_W)
-        self.win_input  = curses.newwin(self.input_h, chat_w,    1 + chat_h, SIDEBAR_W)
-        self.win_users  = curses.newwin(sidebar_h,    SIDEBAR_W, 1,          SIDEBAR_W + chat_w)
+        self.win_header = curses.newwin(1,               W,         0,           0)
+        self.win_rooms  = curses.newwin(chat_h,          SIDEBAR_W, 1,           0)
+        self.win_chat   = curses.newwin(chat_h,          chat_w,    1,           SIDEBAR_W)
+        self.win_input  = curses.newwin(self.input_h,    chat_w,    1 + chat_h,  SIDEBAR_W)
+        self.win_users  = curses.newwin(sidebar_h,       SIDEBAR_W, 1,           SIDEBAR_W + chat_w)
+        # Player panel: one row above input box, to its left
+        self.win_player = curses.newwin(self.input_h,    SIDEBAR_W, chat_h,      0)
 
         self.H, self.W = H, W
         self.chat_h    = chat_h
@@ -353,6 +362,7 @@ class ChatUI:
             f"Image Preview: {'ON' if self.image_preview_enabled else 'OFF'}",
             f"Open URLs with: {self.url_opener}",
             f"Hide guests: {'ON' if self.hide_guests else 'OFF'}",
+            f"Media Player: {'ON' if self.media_player_enabled else 'OFF'}",
             "Pick username color…" if self.colour_list else "Pick color (not loaded)",
             "Logout",
             "Quit",
@@ -421,8 +431,8 @@ class ChatUI:
         self.stdscr.clearok(True)
         self.stdscr.touchwin()
         self.stdscr.noutrefresh()
-        for w in (self.win_header, self.win_rooms, self.win_chat,
-                  self.win_input, self.win_users):
+        for w in (self.win_header, self.win_rooms, self.win_player,
+                  self.win_chat, self.win_input, self.win_users):
             try:
                 w.clearok(True)
                 w.touchwin()
@@ -446,6 +456,7 @@ class ChatUI:
                 self._build_windows()
             self._draw_header(rooms, current_room_id, own_username)
             self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker, own_username=own_username)
+            self._draw_player()
             self._draw_chat(own_username)
             self._draw_users(connected_list, current_room_id, own_user=self._own_user)
             self._draw_input()
@@ -949,6 +960,75 @@ class ChatUI:
     # Motto scrolls one character every this many seconds
     _MOTTO_CHAR_INTERVAL = 0.25
 
+    # ── Player panel ──────────────────────────────────────────────────────
+
+    def _draw_player(self) -> None:
+        w = self.win_player
+        w.erase()
+        H, W  = w.getmaxyx()
+        focused = self.focus == Focus.PLAYER
+
+        # Row 0: header
+        try:
+            w.addstr(0, 0, "   PLAYER"[:W].ljust(W),
+                     curses.color_pair(C_HEADER) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        if H < 2:
+            w.noutrefresh()
+            return
+
+        if not self.media_player_enabled:
+            try:
+                w.addstr(1, 1, "OFF"[:W - 2], curses.color_pair(C_ITEM_IDLE))
+            except curses.error:
+                pass
+            w.noutrefresh()
+            return
+
+        # Row 1: track title — highlight colour when focused
+        if self.player_active and self.player_title:
+            label = self.player_title
+        elif self.player_active:
+            label = "Playing…"
+        else:
+            label = "No media"
+        try:
+            if focused:
+                title_attr = curses.color_pair(C_ITEM_CURSOR) | curses.A_BOLD
+            elif self.player_active:
+                title_attr = curses.color_pair(C_INPUT)
+            else:
+                title_attr = curses.color_pair(C_ITEM_IDLE)
+            w.addstr(1, 1, label[:W - 2].ljust(W - 2), title_attr)
+        except curses.error:
+            pass
+
+        if H < 3:
+            w.noutrefresh()
+            return
+
+        # Row 2: play/pause + volume
+        if not self.player_active:
+            status = "○"
+        elif self.player_paused:
+            status = "⏸"
+        else:
+            status = "▶"
+        bar_w  = max(2, W - 8)
+        filled = round(self.player_volume / 100 * bar_w)
+        bar    = "█" * filled + "░" * (bar_w - filled)
+        row2   = f"{status} {bar} {self.player_volume:3d}%"
+        try:
+            attr = curses.color_pair(C_TIMESTAMP)
+            w.addstr(2, 1, row2[:W - 2], attr)
+        except curses.error:
+            pass
+
+        w.noutrefresh()
+
+    # ── Users sidebar ─────────────────────────────────────────────────
     def _draw_users(self, connected_list: List[Dict],
                     current_room_id: Optional[int] = None,
                     own_user: Optional[Dict] = None) -> None:

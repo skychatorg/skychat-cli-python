@@ -384,8 +384,84 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     ui     = ChatUI(stdscr)
     client = SkyChatClient(DEFAULT_WSS_URL, auto_message_ack=True)
 
+    # ── Media player ─────────────────────────────────────────────────────
+    import subprocess as _sp, json as _json, os as _os, socket as _sock
+
+    _player_proc: Optional[_sp.Popen] = None
+    _player_url:  Optional[str]       = None
+    _player_ipc   = f"/tmp/skychat_mpv_{_os.getpid()}.sock"
+
+    def _mpv_cmd(*args):
+        """Send a command to the running mpv via its IPC socket. Silently no-ops if not available."""
+        try:
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            s.settimeout(0.2)
+            s.connect(_player_ipc)
+            s.sendall((_json.dumps({"command": list(args)}) + "\n").encode())
+            s.close()
+        except Exception:
+            pass
+
+    def _player_stop():
+        nonlocal _player_proc, _player_url
+        if _player_proc is not None:
+            try:
+                _player_proc.terminate()
+            except Exception:
+                pass
+            _player_proc = None
+        _player_url        = None
+        ui.player_active   = False
+        ui.player_paused   = False
+
+    def _player_sync(data):
+        nonlocal _player_proc, _player_url
+        if not ui.media_player_enabled:
+            return
+        if not isinstance(data, dict):
+            return
+        current = data.get("current")
+        if not current:
+            _player_stop()
+            return
+        video = current.get("video") or {}
+        vid_id = video.get("id")
+        if not vid_id:
+            return
+        if vid_id == _player_url:
+            return  # same video already playing
+        # Calculate current position from server start time
+        import time as _time
+        start_time_ms  = float(video.get("startTime")  or 0)
+        start_cursor_ms = float(video.get("startCursor") or 0)
+        seek_s = max(0.0, (start_cursor_ms + (_time.time() * 1000 - start_time_ms)) / 1000)
+        url = f"https://www.youtube.com/watch?v={vid_id}"
+        _player_stop()
+        _player_url        = vid_id
+        title              = video.get("title", "")
+        ui.player_title    = title
+        ui.player_active   = True
+        ui.player_paused   = False
+        ui.set_status(f"▶ {title}"[:60], ttl=4.0)
+        try:
+            _player_proc = _sp.Popen(
+                ["mpv", "--no-video", "--really-quiet",
+                 f"--input-ipc-server={_player_ipc}",
+                 f"--volume={ui.player_volume}",
+                 f"--start={seek_s:.1f}", url],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+        except FileNotFoundError:
+            ui.set_status("✗  mpv not found", ttl=3.0)
+            ui.player_active = False
+        except Exception as e:
+            ui.set_status(f"✗  player: {e}", ttl=3.0)
+            ui.player_active = False
+
     # ── Event wiring ────────────────────────────────────────────────────
     _wire_events(client, ui)
+    client.on("player-sync",    _player_sync)
+    client.on("player-channel", lambda ch: _player_stop() if ch is None else None)
 
     # ── Connect & auth ──────────────────────────────────────────────────
     conn_task = await _connect_and_auth(
@@ -461,20 +537,26 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 ui.hide_guests = not ui.hide_guests
                 save_config({'hide_guests': ui.hide_guests})
                 ui.set_status(f'Hide guests {"ON" if ui.hide_guests else "OFF"}', ttl=2.0)
-            elif ui.menu_cursor == 5:  # Pick colour
+            elif ui.menu_cursor == 5:  # Toggle media player
+                ui.media_player_enabled = not ui.media_player_enabled
+                save_config({'media_player': ui.media_player_enabled})
+                if not ui.media_player_enabled:
+                    _player_stop()
+                ui.set_status(f'Media Player {"ON" if ui.media_player_enabled else "OFF"}', ttl=2.0)
+            elif ui.menu_cursor == 6:  # Pick colour
                 if ui.colour_list:
                     ui.colour_pick_open   = True
                     ui.colour_pick_cursor = 0
                 else:
                     ui.set_status('✗  Colour list not yet received', ttl=3.0)
-            elif ui.menu_cursor == 6:  # Logout
+            elif ui.menu_cursor == 7:  # Logout
                 ui.menu_open = False
                 save_token(None)
                 save_config({'username': ''})
                 client.stop()
                 conn_task.cancel()
                 return True
-            elif ui.menu_cursor == 7:  # Quit
+            elif ui.menu_cursor == 8:  # Quit
                 ui.menu_open = False
                 client.stop()
                 conn_task.cancel()
@@ -533,6 +615,25 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                     ui.set_status(f"Opening DM with {target}…", ttl=5.0)
                     asyncio.ensure_future(client.open_dm(target))
                 ui.focus = Focus.INPUT
+        return False
+
+    async def _handle_player_key(key) -> bool:
+        """Handle keypresses while the PLAYER panel is focused. Always returns False."""
+        if key in (' ', 32):
+            _mpv_cmd("cycle", "pause")
+            ui.player_paused = not ui.player_paused
+        elif key == curses.KEY_UP:
+            ui.player_volume = min(100, ui.player_volume + 5)
+            _mpv_cmd("set_property", "volume", ui.player_volume)
+            save_config({'player_volume': ui.player_volume})
+        elif key == curses.KEY_DOWN:
+            ui.player_volume = max(0, ui.player_volume - 5)
+            _mpv_cmd("set_property", "volume", ui.player_volume)
+            save_config({'player_volume': ui.player_volume})
+        elif key == curses.KEY_RIGHT:
+            _mpv_cmd("seek", 10)
+        elif key == curses.KEY_LEFT:
+            _mpv_cmd("seek", -10)
         return False
 
     async def _handle_input_key(key) -> bool:
@@ -1004,6 +1105,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         elif ui.focus == Focus.USERS:
             if await _handle_users_key(key):
                 break
+        elif ui.focus == Focus.PLAYER:
+            if await _handle_player_key(key):
+                break
         elif await _handle_input_key(key):
             break
 
@@ -1012,6 +1116,7 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     # Cleanup — restore terminal to normal paste mode
     sys.stdout.write('\x1b[?2004l')
     sys.stdout.flush()
+    _player_stop()
     client.stop()
     await client.disconnect()
     conn_task.cancel()
