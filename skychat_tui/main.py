@@ -28,7 +28,7 @@ from .images import (
 )
 from .ui import (
     ChatUI, Focus, _setup_colors, _apply_theme, THEMES, THEME_NAMES,
-    MENU_ITEM_COUNT,
+    MENU_ITEM_COUNT, get_active_theme,
 )
 from .client import SkyChatClient
 from .login import ncurses_login, _RESUME_SESSION
@@ -339,10 +339,10 @@ async def _connect_and_auth(
                 client.off("error",    _resume_fail)
         elif guest:
             ui.set_status("Joining as guest…")
-            await client.login_as_guest(room_id=DEFAULT_ROOM_ID)
+            await client.login_as_guest()
         else:
             ui.set_status(f"Logging in as {username}…")
-            await client.login(username, password, room_id=DEFAULT_ROOM_ID)
+            await client.login(username, password)
     except Exception as exc:
         ui.set_status(f"✗  Auth failed: {exc}  — press any key")
         ui.draw_all([], None, [], "")
@@ -438,9 +438,9 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             ui.menu_cursor = (ui.menu_cursor + 1) % MENU_ITEM_COUNT
         elif key in (curses.KEY_ENTER, '\n', '\r', 10):
             if ui.menu_cursor == 0:   # Cycle theme
-                idx = (THEME_NAMES.index(_active_theme) + 1) % len(THEME_NAMES)
+                idx = (THEME_NAMES.index(get_active_theme()) + 1) % len(THEME_NAMES)
                 _apply_theme(THEME_NAMES[idx])
-                ui.set_status(f'Theme: {_active_theme}', ttl=2.0)
+                ui.set_status(f'Theme: {THEME_NAMES[idx]}', ttl=2.0)
             elif ui.menu_cursor == 1:  # Toggle notifications
                 ui.notifications_enabled = not ui.notifications_enabled
                 save_config({'notifications': ui.notifications_enabled})
@@ -591,20 +591,36 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             oldest, newest = ui._last_msg_range
             if ui.scroll_cursor >= 0:
                 if ui.scroll_cursor <= oldest:
-                    ui.scroll_up(1)
+                    if ui.scroll_line_offset < ui._last_natural_skip:
+                        # More of the topmost message is hidden above — reveal one line
+                        ui.scroll_line_offset += 1
+                    else:
+                        # Already at the top — scroll to previous message.
+                        # Don't reset scroll_line_offset here: if scroll_up can't
+                        # go further (oldest message), _draw_chat won't change
+                        # oldest_idx and the view should stay at the top.
+                        # If scroll_up succeeds, oldest_idx changes and _draw_chat
+                        # resets scroll_line_offset automatically.
+                        ui.scroll_up(1)
                 else:
                     ui.scroll_cursor -= 1
+                    ui.scroll_line_offset = 0
             else:
                 ui.scroll_cursor = newest
+                ui.scroll_line_offset = 0
 
         elif key == curses.KEY_DOWN:
             oldest, newest = ui._last_msg_range
             if ui.scroll_cursor >= 0:
                 if ui.scroll_cursor >= newest:
-                    ui.scroll_down(1) if ui.scroll_offset > 0 else ui.scroll_cursor_clear()
+                    if ui.scroll_line_offset > 0:
+                        ui.scroll_line_offset -= 1
+                    else:
+                        ui.scroll_down(1) if ui.scroll_offset > 0 else ui.scroll_cursor_clear()
                 else:
                     ui.scroll_cursor += 1
                     ui.btn_cursor = 0
+                    ui.scroll_line_offset = 0
             else:
                 ui.scroll_down(1)
 

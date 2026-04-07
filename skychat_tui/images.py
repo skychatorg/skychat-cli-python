@@ -101,7 +101,10 @@ IMAGE_EXTS = frozenset({
 
 
 def _is_image_url(url: str) -> bool:
-    return any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in IMAGE_EXTS)
+    try:
+        return any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in IMAGE_EXTS)
+    except ValueError:
+        return False
 
 
 def _query_cell_pixels() -> Tuple[int, int]:

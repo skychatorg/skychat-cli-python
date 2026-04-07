@@ -148,6 +148,10 @@ def _apply_theme(name: str) -> None:
 
 
 
+def get_active_theme() -> str:
+    return _active_theme
+
+
 def _setup_colors() -> None:
     curses.start_color()
     saved = load_config().get("theme", "Dracula")
@@ -190,9 +194,11 @@ class ChatUI:
         self._colour_pair_cache:  Dict[int, int] = {}
         self._next_pair:          int            = C_DYN_BASE
         self._last_visible_count: int            = 0
-        self._last_lines_out:     list           = []
         self._last_msg_range:     tuple          = (0, 0)
         self._last_skip_top:      int            = 0   # lines clipped from topmost msg
+        self._last_natural_skip:  int            = 0   # skip before scroll_line_offset
+        self._last_oldest_idx:    int            = -1  # oldest visible msg index
+        self.scroll_line_offset:  int            = 0   # extra lines revealed from top of topmost msg
 
         # History lazy-loading
         self.history_exhausted:   bool             = False
@@ -250,7 +256,10 @@ class ChatUI:
         curses.resizeterm(H, W)
         self.stdscr.erase()
         self.stdscr.noutrefresh()
-        self._build_windows()
+        try:
+            self._build_windows()
+        except curses.error:
+            pass
 
     # ── Focus ─────────────────────────────────────────────────────────
 
@@ -431,6 +440,10 @@ class ChatUI:
         if typing_list is not None:
             self.typing_list = [u for u in typing_list if not self._is_hidden(u)]
         try:
+            # Rebuild windows before any drawing if input height changed, so all
+            # panels use consistent window objects throughout the draw cycle.
+            if self._update_input_height():
+                self._build_windows()
             self._draw_header(rooms, current_room_id, own_username)
             self._draw_rooms(rooms, current_room_id, connected_list, unread_checker=unread_checker, own_username=own_username)
             self._draw_chat(own_username)
@@ -501,15 +514,19 @@ class ChatUI:
         # Last usable column (W-1 is off-limits in curses — writing there errors)
         inner_w = W
 
-        # Count users per room — normalise both sides to int
+        # Count users per room — use rooms[-1] as the user's active room
+        # (rooms[0] is a permanent base subscription that never changes).
         room_counts: Dict[int, int] = {}
         for session in connected_list:
-            for rid in (session.get("rooms") or []):
-                try:
-                    k = int(rid)
-                    room_counts[k] = room_counts.get(k, 0) + 1
-                except (ValueError, TypeError):
-                    pass
+            rooms_s = session.get("rooms") or []
+            if not rooms_s:
+                continue
+            try:
+                r = rooms_s[-1]
+                k = int(r.get("id", r) if isinstance(r, dict) else r)
+                room_counts[k] = room_counts.get(k, 0) + 1
+            except (ValueError, TypeError):
+                pass
 
         title = (" ▶ CHANNELS" if focused else "   CHANNELS")
         try:
@@ -630,17 +647,23 @@ class ChatUI:
     def _draw_message(
         self, w, msg: dict, mi: int, row: int,
         H: int, W: int, margin: int, usable_w: int,
-        own_username: str, lines_out: list,
+        own_username: str,
         skip_lines: int = 0,
     ) -> int:
         """Render one message starting at *row*. Returns the next free row.
-        skip_lines: skip this many lines from the top of the message (for partial
-        display when the message is clipped at the top of the viewport)."""
+        skip_lines: skip this many visual lines from the top of the message
+        (for partial display when the message is clipped at the viewport top).
+
+        Rendering is lazy: whole logical lines that fall entirely within the
+        skip zone are fast-pathed with a cheap line-count call so we never do
+        O(total_lines) URL/button span work for a single extremely long message.
+        """
         ts, user, msg_content = msg["ts"], msg["user"], msg["content"]
         is_sel = (self.scroll_cursor == mi)
         sel_a  = curses.color_pair(C_MSG_SELECT)
         qt_a   = curses.color_pair(C_TIMESTAMP)
         prefix = len(ts) + 1 + len(user) + 2
+        width  = max(8, usable_w - prefix)
         _skip  = skip_lines   # mutable counter — decremented as we skip lines
 
         # ── Quoted line ───────────────────────────────────────────────
@@ -656,7 +679,6 @@ class ChatUI:
             if len(q_text) > avail:
                 q_text = q_text[:avail - 1] + "…"
             q_line = q_prefix + q_text
-            lines_out.append((ts, user, q_line, False))
             if _skip > 0:
                 _skip -= 1
             else:
@@ -669,115 +691,136 @@ class ChatUI:
                     pass
                 row += 1
 
-        # ── Wrapped content lines ─────────────────────────────────────
-        _msg_interactables = _get_interactables(msg_content)
-        wrapped = []
-        wrapped_meta = []  # (chunk, chunk_urls, chunk_btns, is_greentext)
-        for _ln in msg_content.split("\n"):
-            _is_gt = _ln.lstrip().startswith(">")
-            for item in ChatUI._wrap_with_spans(_ln, max(8, usable_w - prefix)):
-                wrapped_meta.append(item + (_is_gt,))
+        # ── Wrapped content lines (lazy) ──────────────────────────────
+        # Only compute interactables for selected messages (avoids O(n) regex
+        # on every frame for non-selected messages).
+        _msg_interactables = _get_interactables(msg_content) if is_sel else []
+        wi = 0  # cumulative visual-line index across all logical lines
 
-        for wi, (chunk, chunk_urls, chunk_btns, is_greentext) in enumerate(wrapped_meta):
+        for _ln in msg_content.split("\n"):
             if row >= H - 1:
                 break
-            is_first = (wi == 0)
-            lines_out.append((ts, user, chunk, is_first))
-            if _skip > 0:
-                _skip -= 1
-                continue
-            col = margin
+            _is_gt = _ln.lstrip().startswith(">")
 
-            def _draw_segment(txt, base_attr,
-                               url_ranges=chunk_urls, btn_ranges=chunk_btns):
-                nonlocal col
-                spans = sorted(
-                    [(s, e, "url", uv)  for s, e, uv    in url_ranges] +
-                    [(s, e, "btn", act) for s, e, _, act in btn_ranges],
-                    key=lambda x: x[0],
-                )
-                i2 = 0
-                for ss, se, kind, action in spans:
-                    if col >= W - 1: break
-                    if ss > i2:
-                        plain = _cols_slice(txt[i2:ss], max(0, W - col - 1))
+            if _skip > 0:
+                # Fast-path: count visual lines without computing URL/button
+                # spans.  This keeps rendering O(screen_height) even for
+                # messages with thousands of visual lines above the viewport.
+                _disp = BUTTON_RE.sub(lambda m: f'[{m.group(1)}]', _ln)
+                _vis  = len(_cols_aware_wrap(_disp, width))
+                if _skip >= _vis:
+                    # Entire logical line is above the viewport — skip it.
+                    _skip -= _vis
+                    wi    += _vis
+                    continue
+                # Partial skip: the visible portion starts partway through
+                # this logical line.  Build span data only for the visible
+                # tail, advancing wi by the number of skipped items so the
+                # loop body never has to iterate over off-screen chunks.
+                items  = list(ChatUI._wrap_with_spans(_ln, width))
+                wi    += _skip
+                items  = items[_skip:]
+                _skip  = 0
+            else:
+                items = list(ChatUI._wrap_with_spans(_ln, width))
+
+            for chunk, chunk_urls, chunk_btns in items:
+                if row >= H - 1:
+                    break
+                is_first = (wi == 0)
+                wi += 1
+
+                col = margin
+
+                def _draw_segment(txt, base_attr,
+                                   url_ranges=chunk_urls, btn_ranges=chunk_btns):
+                    nonlocal col
+                    spans = sorted(
+                        [(s, e, "url", uv)  for s, e, uv    in url_ranges] +
+                        [(s, e, "btn", act) for s, e, _, act in btn_ranges],
+                        key=lambda x: x[0],
+                    )
+                    i2 = 0
+                    for ss, se, kind, action in spans:
+                        if col >= W - 1: break
+                        if ss > i2:
+                            plain = _cols_slice(txt[i2:ss], max(0, W - col - 1))
+                            try: w.addstr(row, col, plain, base_attr)
+                            except curses.error: pass
+                            col += _str_cols(plain)
+                        seg = _cols_slice(txt[ss:se], max(0, W - col - 1))
+                        focused_val = (_msg_interactables[self.btn_cursor % len(_msg_interactables)][0]
+                                       if is_sel and _msg_interactables else None)
+                        if kind == "url":
+                            seg_attr = (base_attr | curses.A_UNDERLINE | curses.A_REVERSE
+                                        if is_sel and action == focused_val
+                                        else base_attr | curses.A_UNDERLINE)
+                        else:
+                            seg_attr = (base_attr | curses.A_BOLD | curses.A_REVERSE
+                                        if is_sel and action == focused_val
+                                        else base_attr | curses.A_BOLD)
+                        try: w.addstr(row, col, seg, seg_attr)
+                        except curses.error: pass
+                        col += _str_cols(seg)
+                        i2  = se
+                    if i2 < len(txt) and col < W - 1:
+                        plain = _cols_slice(txt[i2:], max(0, W - col - 1))
                         try: w.addstr(row, col, plain, base_attr)
                         except curses.error: pass
                         col += _str_cols(plain)
-                    seg = _cols_slice(txt[ss:se], max(0, W - col - 1))
-                    focused_val = (_msg_interactables[self.btn_cursor % len(_msg_interactables)][0]
-                                   if is_sel and _msg_interactables else None)
-                    if kind == "url":
-                        seg_attr = (base_attr | curses.A_UNDERLINE | curses.A_REVERSE
-                                    if is_sel and action == focused_val
-                                    else base_attr | curses.A_UNDERLINE)
-                    else:
-                        seg_attr = (base_attr | curses.A_BOLD | curses.A_REVERSE
-                                    if is_sel and action == focused_val
-                                    else base_attr | curses.A_BOLD)
-                    try: w.addstr(row, col, seg, seg_attr)
-                    except curses.error: pass
-                    col += _str_cols(seg)
-                    i2  = se
-                if i2 < len(txt) and col < W - 1:
-                    plain = _cols_slice(txt[i2:], max(0, W - col - 1))
-                    try: w.addstr(row, col, plain, base_attr)
-                    except curses.error: pass
-                    col += _str_cols(plain)
 
-            try:
-                if is_sel:
-                    w.addstr(row, 0, " " * (W - 1), sel_a)
-                if is_first:
-                    ts_a = sel_a if is_sel else curses.color_pair(C_TIMESTAMP)
-                    w.addstr(row, col, f"{ts} ", ts_a)
-                    col += len(ts) + 1
+                try:
                     if is_sel:
-                        ua = sel_a | curses.A_BOLD
-                    else:
-                        hex_col = msg.get("col", "")
-                        if hex_col:
-                            ua = curses.color_pair(self._hex_colour_pair(hex_col)) | curses.A_BOLD
-                        elif user == own_username:
-                            ua = curses.color_pair(C_SELF) | curses.A_BOLD
+                        w.addstr(row, 0, " " * (W - 1), sel_a)
+                    if is_first:
+                        ts_a = sel_a if is_sel else curses.color_pair(C_TIMESTAMP)
+                        w.addstr(row, col, f"{ts} ", ts_a)
+                        col += len(ts) + 1
+                        if is_sel:
+                            ua = sel_a | curses.A_BOLD
                         else:
-                            ua = curses.color_pair(C_USERNAME) | curses.A_BOLD
-                    w.addstr(row, col, user, ua)
-                    col += len(user)
-                    w.addstr(row, col, ": ",
-                             sel_a if is_sel else curses.color_pair(C_TIMESTAMP))
-                    col += 2
-                else:
-                    col += prefix
+                            hex_col = msg.get("col", "")
+                            if hex_col:
+                                ua = curses.color_pair(self._hex_colour_pair(hex_col)) | curses.A_BOLD
+                            elif user == own_username:
+                                ua = curses.color_pair(C_SELF) | curses.A_BOLD
+                            else:
+                                ua = curses.color_pair(C_USERNAME) | curses.A_BOLD
+                        w.addstr(row, col, user, ua)
+                        col += len(user)
+                        w.addstr(row, col, ": ",
+                                 sel_a if is_sel else curses.color_pair(C_TIMESTAMP))
+                        col += 2
+                    else:
+                        col += prefix
 
-                remaining = chunk[:max(0, W - col - 1)]
-                if not is_sel and own_username and f"@{own_username}" in remaining:
-                    needle = f"@{own_username}"
-                    i2, txt2 = 0, remaining
-                    while i2 < len(txt2) and col < W - 1:
-                        pos = txt2.find(needle, i2)
-                        if pos == -1:
-                            _draw_segment(txt2[i2:], 0)
-                            break
-                        if pos > i2:
-                            _draw_segment(txt2[i2:pos], 0)
-                        mention = needle[:max(0, W - col - 1)]
-                        try: w.addstr(row, col, mention,
-                                      curses.color_pair(C_ERROR) | curses.A_BOLD)
-                        except curses.error: pass
-                        col += len(needle)
-                        i2 = pos + len(needle)
-                else:
-                    _draw_segment(remaining, sel_a if is_sel else (curses.color_pair(C_USER_ONLINE) if is_greentext else 0))
-            except curses.error:
-                pass
-            row += 1
+                    remaining = chunk[:max(0, W - col - 1)]
+                    if not is_sel and own_username and f"@{own_username}" in remaining:
+                        needle = f"@{own_username}"
+                        i2, txt2 = 0, remaining
+                        while i2 < len(txt2) and col < W - 1:
+                            pos = txt2.find(needle, i2)
+                            if pos == -1:
+                                _draw_segment(txt2[i2:], 0)
+                                break
+                            if pos > i2:
+                                _draw_segment(txt2[i2:pos], 0)
+                            mention = needle[:max(0, W - col - 1)]
+                            try: w.addstr(row, col, mention,
+                                          curses.color_pair(C_ERROR) | curses.A_BOLD)
+                            except curses.error: pass
+                            col += len(needle)
+                            i2 = pos + len(needle)
+                    else:
+                        _draw_segment(remaining, sel_a if is_sel else (curses.color_pair(C_USER_ONLINE) if _is_gt else 0))
+                except curses.error:
+                    pass
+                row += 1
 
         # ── Reaction bar ──────────────────────────────────────────────
         reactions = msg.get("reactions", {})
         if reactions and row < H - 1:
             rbar = "".join(f" {e}×{c} " for e, c in list(reactions.items())[:8])
-            lines_out.append((ts, user, rbar, False))
             if _skip > 0:
                 _skip -= 1
             else:
@@ -844,7 +887,6 @@ class ChatUI:
         total = len(self.messages)
         if total == 0:
             self._last_msg_range = (0, 0)
-            self._last_lines_out = []
             w.noutrefresh()
             return
 
@@ -875,22 +917,29 @@ class ChatUI:
         oldest_idx               = render_msgs[0] if render_msgs else newest_idx
         self._last_msg_range     = (oldest_idx, newest_idx)
         self._last_visible_count = len(render_msgs)
-        self._last_skip_top      = skip_top
+
+        # Reset line-scroll when the topmost message changes (new layout)
+        if oldest_idx != self._last_oldest_idx:
+            self.scroll_line_offset = 0
+            self._last_oldest_idx   = oldest_idx
+        # Clamp and apply sub-message line offset
+        self._last_natural_skip     = skip_top
+        self.scroll_line_offset     = max(0, min(self.scroll_line_offset, skip_top))
+        skip_top                    = skip_top - self.scroll_line_offset
+        self._last_skip_top         = skip_top
 
         if self.scroll_cursor >= 0:
             self.scroll_cursor = max(oldest_idx, min(newest_idx, self.scroll_cursor))
 
         # ── Render pass ───────────────────────────────────────────────
-        row          = max(0, H - 1 - rows_used)
-        lines_out: List[tuple] = []
+        row = max(0, H - 1 - rows_used)
         for mi in render_msgs:
             skip = skip_top if mi == render_msgs[0] else 0
             row = self._draw_message(
                 w, self.messages[mi], mi, row,
-                H, W, margin, usable_w, own_username, lines_out,
+                H, W, margin, usable_w, own_username,
                 skip_lines=skip,
             )
-        self._last_lines_out = lines_out
 
         self._draw_chat_statusbar(w, H, W, total, own_username)
         w.noutrefresh()
@@ -916,7 +965,11 @@ class ChatUI:
                 continue
             rooms = session.get("rooms") or []
             try:
-                in_cur = current_room_id is not None and current_room_id in [int(r) for r in rooms]
+                def _rid(r):
+                    return int(r.get("id", r) if isinstance(r, dict) else r)
+                # rooms[-1] is the user's active chat room; rooms[0] is a
+                # permanent base subscription that is never removed.
+                in_cur = current_room_id is not None and bool(rooms) and _rid(rooms[-1]) == current_room_id
             except (ValueError, TypeError):
                 in_cur = False
             if in_cur:
@@ -1040,10 +1093,6 @@ class ChatUI:
     # ── Input box ─────────────────────────────────────────────────────
 
     def _draw_input(self) -> None:
-        # Rebuild windows if input height changed due to text content
-        if self._update_input_height():
-            self._build_windows()
-
         w = self.win_input
         H, W    = w.getmaxyx()
         focused = self.focus == Focus.INPUT
@@ -1178,7 +1227,10 @@ class ChatUI:
         self.input_vscroll  = 0
         if self.input_h != INPUT_H:
             self.input_h = INPUT_H
-            self._build_windows()
+            try:
+                self._build_windows()
+            except curses.error:
+                pass
         return t
 
     def _user_colour_pair(self, xterm_idx: int) -> int:
@@ -1212,8 +1264,9 @@ class ChatUI:
         return result
 
     def scroll_cursor_clear(self) -> None:
-        self.scroll_cursor = -1
-        self.btn_cursor    = 0
+        self.scroll_cursor      = -1
+        self.btn_cursor         = 0
+        self.scroll_line_offset = 0
 
     def scroll_up(self, n: int = 1) -> None:
         self.scroll_offset = min(self.scroll_offset + n, max(0, len(self.messages) - 1))

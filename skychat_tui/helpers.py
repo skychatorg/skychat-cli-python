@@ -266,6 +266,32 @@ def _room_display_name(room: Dict, own_username: str = "") -> str:
 
 # ── WebSocket delta patching ──────────────────────────────────────────────────
 
+def _apply_jsondiffpatch_object(obj: dict, delta: dict) -> dict:
+    """Apply a jsondiffpatch object delta to a plain dict.
+
+    Each key in delta maps to:
+      [val]          -> add field
+      [old, new]     -> replace field
+      [old, 0, 0]    -> delete field
+      {_t:'a', ...}  -> nested array delta
+      {...}          -> nested object delta
+    """
+    result = dict(obj)
+    for fk, fv in delta.items():
+        if isinstance(fv, list) and len(fv) == 1:
+            result[fk] = fv[0]
+        elif isinstance(fv, list) and len(fv) == 2:
+            result[fk] = fv[1]
+        elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
+            result.pop(fk, None)
+        elif isinstance(fv, dict):
+            if fv.get('_t') == 'a' and isinstance(result.get(fk), list):
+                result[fk] = _apply_jsondiffpatch_array(result[fk], fv)
+            elif isinstance(result.get(fk), dict):
+                result[fk] = _apply_jsondiffpatch_object(result[fk], fv)
+    return result
+
+
 def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
     """Apply a jsondiffpatch array delta (with _t:'a') to a list.
 
@@ -333,6 +359,14 @@ def _apply_jsondiffpatch_array(lst: list, delta: dict) -> list:
                 item[fk] = fv[0]
             elif isinstance(fv, list) and len(fv) == 3 and fv[1] == 0 and fv[2] == 0:
                 item.pop(fk, None)
+            elif isinstance(fv, dict):
+                # Nested delta — recurse.  The server uses jsondiffpatch's
+                # array plugin, so fields like `rooms` produce {_t:'a',...}
+                # instead of a simple [old,new] replacement.
+                if fv.get('_t') == 'a' and isinstance(item.get(fk), list):
+                    item[fk] = _apply_jsondiffpatch_array(item[fk], fv)
+                elif isinstance(item.get(fk), dict):
+                    item[fk] = _apply_jsondiffpatch_object(item[fk], fv)
         new_lst[mod_idx] = item
 
     return new_lst

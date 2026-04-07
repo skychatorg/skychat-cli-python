@@ -67,7 +67,7 @@ class SkyChatClient:
         self.on("config",         lambda _: None)
         self.on("room-list",      lambda r: setattr(self, '_rooms', r))
         def _on_join_room(rid):
-            self._current_room_id    = rid
+            self._current_room_id      = rid
             self._scroll_ack_last_sent = 0
             self._scroll_ack_candidate = 0
             self._scroll_ack_since     = 0.0
@@ -335,20 +335,6 @@ class SkyChatClient:
 
     async def join(self, room_id: int) -> None:
         self._current_room_id = room_id
-        # Optimistically update own session in the connected list so the user
-        # list shows the correct in-room presence immediately, without waiting
-        # for the next server patch (which arrives up to 2s later).
-        own_id = self._user.get("id")
-        if own_id is not None:
-            for session in self._connected_list:
-                if session.get("user", {}).get("id") == own_id:
-                    old_rooms = set(session.get("rooms") or [])
-                    # Remove previous room, add new one
-                    if self._current_room_id is not None:
-                        old_rooms.discard(self._current_room_id)
-                    session["rooms"] = list(old_rooms | {room_id})
-                    self._connected_list_dirty = True
-                    break
         await self.send_message(f"/join {room_id}")
 
     async def send_message(self, msg: str) -> None:
