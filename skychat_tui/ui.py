@@ -219,10 +219,13 @@ class ChatUI:
         self.hide_guests: bool = load_config().get('hide_guests', False)
         self.media_player_enabled: bool = load_config().get('media_player', False)
         # Player panel state (updated by main loop)
-        self.player_title:  str  = ""
-        self.player_paused: bool = False
-        self.player_volume: int  = int(load_config().get('player_volume', 100))
-        self.player_active: bool = False
+        self.player_title:       str   = ""
+        self.player_paused:      bool  = False
+        self.player_volume:      int   = int(load_config().get('player_volume', 100))
+        self.player_active:      bool  = False
+        self.player_start_ms:    float = 0.0   # epoch-ms when server started this track
+        self.player_cursor_ms:   float = 0.0   # ms into track at player_start_ms
+        self.player_duration_ms: float = 0.0   # total track length in ms
         self._own_user: Optional[Dict] = None
         self.colour_list:           List[Dict] = []  # from server 'custom' event
         self.colour_pick_open:      bool       = False
@@ -242,8 +245,8 @@ class ChatUI:
         self.win_chat   = curses.newwin(chat_h,          chat_w,    1,           SIDEBAR_W)
         self.win_input  = curses.newwin(self.input_h,    chat_w,    1 + chat_h,  SIDEBAR_W)
         self.win_users  = curses.newwin(sidebar_h,       SIDEBAR_W, 1,           SIDEBAR_W + chat_w)
-        # Player panel: one row above input box, to its left
-        self.win_player = curses.newwin(self.input_h,    SIDEBAR_W, chat_h,      0)
+        # Player panel: 4 rows tall, bottom aligned with input box bottom
+        self.win_player = curses.newwin(self.input_h + 1, SIDEBAR_W, chat_h - 1, 0)
 
         self.H, self.W = H, W
         self.chat_h    = chat_h
@@ -963,6 +966,7 @@ class ChatUI:
     # ── Player panel ──────────────────────────────────────────────────────
 
     def _draw_player(self) -> None:
+        import time as _t
         w = self.win_player
         w.erase()
         H, W  = w.getmaxyx()
@@ -1009,20 +1013,37 @@ class ChatUI:
             w.noutrefresh()
             return
 
-        # Row 2: play/pause + volume
-        if not self.player_active:
-            status = "○"
-        elif self.player_paused:
-            status = "⏸"
+        # Row 2: time / progress bar
+        if self.player_active and self.player_duration_ms > 0:
+            elapsed_ms  = (_t.time() * 1000 - self.player_start_ms) if not self.player_paused else 0
+            pos_ms      = max(0.0, min(self.player_duration_ms, self.player_cursor_ms + elapsed_ms))
+            pos_s       = int(pos_ms / 1000)
+            dur_s       = int(self.player_duration_ms / 1000)
+            pos_str     = f"{pos_s // 60}:{pos_s % 60:02d}"
+            dur_str     = f"{dur_s // 60}:{dur_s % 60:02d}"
+            time_label  = f"{pos_str}/{dur_str}"
+            bar_w       = max(2, W - 2 - len(time_label) - 1)
+            filled      = round(pos_ms / self.player_duration_ms * bar_w)
+            bar         = "▶" + "─" * (filled - 1) + "●" + "─" * (bar_w - filled) if filled > 0 else "─" * bar_w
+            row2        = f"{bar} {time_label}"
         else:
-            status = "▶"
+            row2 = "─" * max(1, W - 2)
+        try:
+            w.addstr(2, 1, row2[:W - 2], curses.color_pair(C_TIMESTAMP))
+        except curses.error:
+            pass
+
+        if H < 4:
+            w.noutrefresh()
+            return
+
+        # Row 3: 🔊 volume bar
         bar_w  = max(2, W - 8)
         filled = round(self.player_volume / 100 * bar_w)
-        bar    = "█" * filled + "░" * (bar_w - filled)
-        row2   = f"{status} {bar} {self.player_volume:3d}%"
+        vol_bar = "█" * filled + "░" * (bar_w - filled)
+        row3    = f"🔊 {vol_bar} {self.player_volume:3d}%"
         try:
-            attr = curses.color_pair(C_TIMESTAMP)
-            w.addstr(2, 1, row2[:W - 2], attr)
+            w.addstr(3, 1, row3[:W - 2], curses.color_pair(C_TIMESTAMP))
         except curses.error:
             pass
 

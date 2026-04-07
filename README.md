@@ -54,7 +54,7 @@ SKYCHAT_URL=wss://localhost:8080/api/ws skychat
 ┌──────────┬─────────────────────────┬──────────┐
 │ Channels │      Chat messages      │  Users   │
 │          ├─────────────────────────┤          │
-│          │    Input box            │          │
+│  Player  │    Input box            │          │
 └──────────┴─────────────────────────┴──────────┘
 ```
 
@@ -66,7 +66,7 @@ SKYCHAT_URL=wss://localhost:8080/api/ws skychat
 
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift+Tab` | Cycle focus: Input → Rooms → Users → Input |
+| `Tab` / `Shift+Tab` | Cycle focus: Input → Rooms → Player → Users → Input |
 | `↑` / `↓` (Rooms) | Move room cursor |
 | `Enter` (Rooms) | Join selected room |
 | `Backspace` (Rooms) | Leave selected DM / private room |
@@ -96,6 +96,14 @@ SKYCHAT_URL=wss://localhost:8080/api/ws skychat
 | `Backspace` / `Del` | Delete character |
 | `Enter` | Send message |
 | `Alt+Enter` / `Shift+Enter` | New line (multi-line message) |
+
+### player (Player focus)
+
+| Key | Action |
+|-----|--------|
+| `Space` | Pause / resume |
+| `↑` / `↓` | Volume up / down (5% steps, saved to config) |
+| `→` / `←` | Seek forward / back 10 seconds |
 
 ### image preview
 
@@ -127,6 +135,7 @@ Hover over an image URL in scroll mode and a preview popup appears automatically
 | Toggle notifications | desktop notifications + terminal bell |
 | Image Preview | toggle inline image preview |
 | Open URLs with | cycle between available URL openers (xdg-open, browsh, w3m) |
+| Media Player | toggle synchronized YouTube audio player (requires mpv + yt-dlp) |
 | Pick color | set your username color |
 | Logout | nuke saved token and exit |
 | Quit | exit without clearing token |
@@ -150,6 +159,8 @@ If `~/.skychat_tui.json` exists from an older version it is migrated automatical
 | `notifications` | `true` | desktop notifications |
 | `image_preview` | `true` | inline image preview |
 | `url_opener` | `xdg-open` | URL opener (`xdg-open`, `browsh`, or `w3m`) |
+| `media_player` | `false` | synchronized YouTube audio player |
+| `player_volume` | `100` | player volume (0–100), persisted across sessions |
 
 ## requirements
 
@@ -186,6 +197,26 @@ sudo pacman -S libcaca
 # macOS
 brew install libcaca
 ```
+
+### optional — media player
+
+Synchronized YouTube audio, synced to whatever the room is playing. Enable via the Esc menu.
+
+Requires **mpv** and **yt-dlp**:
+
+```bash
+# Arch
+sudo pacman -S mpv yt-dlp
+
+# Debian/Ubuntu
+sudo apt install mpv
+pip install yt-dlp
+
+# macOS
+brew install mpv yt-dlp
+```
+
+mpv is launched headless (`--no-video`) with an IPC socket for live pause/volume/seek control. Playback position is calculated from the server's `startTime`/`startCursor` fields so it stays in rough sync with other clients.
 
 ### optional — URL openers
 

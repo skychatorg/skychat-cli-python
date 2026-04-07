@@ -432,16 +432,20 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
             return  # same video already playing
         # Calculate current position from server start time
         import time as _time
-        start_time_ms  = float(video.get("startTime")  or 0)
+        start_time_ms   = float(video.get("startTime")   or 0)
         start_cursor_ms = float(video.get("startCursor") or 0)
+        duration_ms     = float(video.get("duration")    or 0)
         seek_s = max(0.0, (start_cursor_ms + (_time.time() * 1000 - start_time_ms)) / 1000)
         url = f"https://www.youtube.com/watch?v={vid_id}"
         _player_stop()
-        _player_url        = vid_id
-        title              = video.get("title", "")
-        ui.player_title    = title
-        ui.player_active   = True
-        ui.player_paused   = False
+        _player_url              = vid_id
+        title                    = video.get("title", "")
+        ui.player_title          = title
+        ui.player_active         = True
+        ui.player_paused         = False
+        ui.player_start_ms       = start_time_ms
+        ui.player_cursor_ms      = start_cursor_ms
+        ui.player_duration_ms    = duration_ms
         ui.set_status(f"▶ {title}"[:60], ttl=4.0)
         try:
             _player_proc = _sp.Popen(
@@ -620,7 +624,16 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
     async def _handle_player_key(key) -> bool:
         """Handle keypresses while the PLAYER panel is focused. Always returns False."""
         if key in (' ', 32):
+            import time as _time
             _mpv_cmd("cycle", "pause")
+            if not ui.player_paused:
+                # Freezing: snapshot current position into cursor so bar stops
+                elapsed = _time.time() * 1000 - ui.player_start_ms
+                ui.player_cursor_ms = max(0.0, ui.player_cursor_ms + elapsed)
+                ui.player_start_ms  = _time.time() * 1000
+            else:
+                # Resuming: reset start_ms so elapsed counts from now
+                ui.player_start_ms = _time.time() * 1000
             ui.player_paused = not ui.player_paused
         elif key == curses.KEY_UP:
             ui.player_volume = min(100, ui.player_volume + 5)
