@@ -414,8 +414,12 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
         ui.player_active   = False
         ui.player_paused   = False
 
+    _last_player_sync: dict = {}
+
     def _player_sync(data):
-        nonlocal _player_proc, _player_url
+        nonlocal _player_proc, _player_url, _last_player_sync
+        if isinstance(data, dict):
+            _last_player_sync = data
         if not ui.media_player_enabled:
             return
         if not isinstance(data, dict):
@@ -546,6 +550,8 @@ async def tui_chat(stdscr, username: Optional[str], password: Optional[str],
                 save_config({'media_player': ui.media_player_enabled})
                 if not ui.media_player_enabled:
                     _player_stop()
+                elif _last_player_sync:
+                    _player_sync(_last_player_sync)
                 ui.set_status(f'Media Player {"ON" if ui.media_player_enabled else "OFF"}', ttl=2.0)
             elif ui.menu_cursor == 6:  # Pick colour
                 if ui.colour_list:
